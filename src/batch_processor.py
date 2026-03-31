@@ -91,9 +91,6 @@ class BatchProcessor:
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
 
-        # COCO writer
-        coco_writer = COCOWriter(active_classes)
-
         # Stats tracking
         summary = {
             "total_images": len(image_paths),
@@ -102,10 +99,11 @@ class BatchProcessor:
             "total_annotations": 0,
             "errors": [],
             "output_dir": str(run_dir),
-            "coco_path": None,
+            "coco_path": str(run_dir / "annotations") if save_coco else None,
         }
 
         viz_alpha = self.out_cfg.get("viz_alpha", 0.5)
+        combined_writer = COCOWriter(active_classes) if save_coco else None
 
         with tqdm(total=len(image_paths), desc="Processing images") as pbar:
             for i, img_path in enumerate(image_paths):
@@ -121,10 +119,16 @@ class BatchProcessor:
                     )
                     img_w, img_h = image.size
 
-                    # Add to COCO
                     if save_coco:
-                        rel_name = img_path.name
-                        coco_writer.add_image_results(rel_name, results, img_w, img_h)
+                        # Per-image JSON named after the source file
+                        per_writer = COCOWriter(active_classes)
+                        per_writer.add_image_results(img_path.name, results, img_w, img_h)
+                        json_dir = run_dir / "annotations"
+                        json_dir.mkdir(parents=True, exist_ok=True)
+                        per_writer.save(json_dir / f"{img_path.stem}.json")
+
+                        # Also accumulate into combined JSON
+                        combined_writer.add_image_results(img_path.name, results, img_w, img_h)
 
                     # Save visualization
                     if save_viz and results:
@@ -145,12 +149,12 @@ class BatchProcessor:
 
                 pbar.update(1)
 
-        # Save COCO JSON
+        # Save combined COCO JSON
         if save_coco:
-            coco_path = run_dir / "annotations.json"
-            coco_writer.save(coco_path)
-            summary["coco_path"] = str(coco_path)
-            summary["coco_summary"] = coco_writer.summary()
+            combined_path = run_dir / "annotations.json"
+            combined_writer.save(combined_path)
+            summary["coco_path"] = str(combined_path)
+            summary["coco_summary"] = combined_writer.summary()
 
         # Save run summary
         summary_path = run_dir / "summary.json"
