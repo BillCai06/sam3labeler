@@ -3,15 +3,6 @@ torch>=2.2.0
 torchvision>=0.17.0
 transformers>=4.45.0
 accelerate>=0.30.0
-qwen-vl-utils>=0.0.8
-
-# Optional: 4-bit quantization for Qwen on smaller GPUs
-# bitsandbytes>=0.43.0
-
-# SAM2 — install separately:
-#   pip install git+https://github.com/facebookresearch/sam2.git
-# SAM1 fallback:
-#   pip install segment-anything
 
 # Image processing
 Pillow>=10.0.0

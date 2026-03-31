@@ -1,5 +1,5 @@
 """
-FastAPI backend for the Qwen VL → SAM segmentation pipeline.
+FastAPI backend for the SAM3 segmentation pipeline.
 
 Endpoints:
   POST /process       — single image (multipart upload + class list)
@@ -44,12 +44,12 @@ _config: dict = {}
 async def lifespan(app: FastAPI):
     """Load models once at startup, unload on shutdown."""
     global _pipeline, _batch_processor, _config
-    logger.info("Loading models...")
+    logger.info("Loading SAM3 models...")
     _config = load_config("config.yaml")
     _pipeline = Pipeline(_config)
     _pipeline.load_models()
     _batch_processor = BatchProcessor(_pipeline, _config)
-    logger.info("Models ready.")
+    logger.info("SAM3 ready.")
     yield
     logger.info("Shutting down, unloading models...")
     if _pipeline:
@@ -57,9 +57,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Qwen3VL → SAM2 Segmentation API",
-    description="Detect objects with Qwen VL, segment with SAM2",
-    version="1.0.0",
+    title="SAM3 Segmentation API",
+    description="Detect and segment objects with SAM3 in a single pass",
+    version="2.0.0",
     lifespan=lifespan,
 )
 

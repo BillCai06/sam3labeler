@@ -119,15 +119,26 @@ def visualize_results(
     return pil_img
 
 
+_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+
+_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
 def _load_font(size: int = 14):
-    """Load a font, falling back to default if not available."""
-    try:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
-    except Exception:
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+    """Load a font at the given size, cached after the first call."""
+    if size not in _font_cache:
+        for path in _FONT_PATHS:
+            try:
+                _font_cache[size] = ImageFont.truetype(path, size)
+                break
+            except Exception:
+                continue
+        else:
+            _font_cache[size] = ImageFont.load_default()
+    return _font_cache[size]
 
 
 def mask_to_polygon(mask: np.ndarray) -> list[list[float]]:

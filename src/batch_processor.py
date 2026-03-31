@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 class BatchProcessor:
     """
-    Processes a folder of images through the Qwen → SAM pipeline.
+    Processes a folder of images through the SAM3 pipeline.
 
     Outputs (in output_dir/run_TIMESTAMP/):
         annotations.json     — COCO format with all instances

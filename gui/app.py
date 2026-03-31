@@ -1,10 +1,10 @@
 """
-Gradio GUI for Qwen VL → SAM segmentation.
+Gradio GUI for SAM3 segmentation.
 
 Tabs:
   1. Single Image  — upload image, pick classes, see results instantly
   2. Batch Folder  — point to a folder, run over all images, download COCO JSON
-  3. Settings      — model config, thresholds
+  3. Help          — tips and thresholds
 
 Run standalone:
     python gui/app.py
@@ -63,13 +63,8 @@ def load_models(config_path: str) -> str:
         yield gr.update(value=status_msg, visible=True)
 
         _pipeline = Pipeline(_config)
-        det_backend = _config.get("models", {}).get("detector", {}).get("backend", "qwen")
-        yield gr.update(value=f"Loading detector ({det_backend})...", visible=True)
+        yield gr.update(value="Loading SAM3 detector...", visible=True)
         _pipeline.detector.load()
-
-        if _pipeline.segmentor is not None:
-            yield gr.update(value="Loading SAM segmentor...", visible=True)
-            _pipeline.segmentor.load()
 
         _batch_proc = BatchProcessor(_pipeline, _config)
         yield gr.update(value="✓ Models loaded successfully!", visible=True)
@@ -236,15 +231,14 @@ def build_app(config_path: str = None) -> gr.Blocks:
     default_output_dir = _config.get("output", {}).get("dir", "outputs")
 
     with gr.Blocks(
-        title="Qwen3VL → SAM Segmentation",
+        title="SAM3 Auto-Labeler",
         theme=gr.themes.Soft(),
         css=".result-box {font-family: monospace; font-size: 12px;}",
     ) as demo:
-        det_backend = _config.get("models", {}).get("detector", {}).get("backend", "qwen")
         gr.Markdown(
-            f"""
+            """
 # SAM3 Auto-Labeler
-**Backend:** `{det_backend}` · Detect objects by class name → segment → export COCO JSON
+Detect objects by class name → segment → export COCO JSON
 """
         )
 
@@ -302,13 +296,13 @@ def build_app(config_path: str = None) -> gr.Blocks:
                     0.0, 1.0,
                     value=_config.get("pipeline", {}).get("confidence_threshold", 0.03),
                     step=0.01,
-                    label="Min detection confidence  (sam3_video: 0.01–0.10 · qwen: 0.25–0.50)",
+                    label="Min detection confidence  (start: 0.03 · lower → more recall · raise → fewer false positives)",
                 )
                 sam_score = gr.Slider(
                     0.0, 1.0,
                     value=_config.get("pipeline", {}).get("sam_score_threshold", 0.0),
                     step=0.05,
-                    label="Min SAM score  (sam3_video: 0.0 · qwen: 0.5)",
+                    label="Min SAM mask quality score  (0.0 = keep all)",
                 )
             return classes_text, selected_classes, confidence, sam_score
 
@@ -431,21 +425,21 @@ def build_app(config_path: str = None) -> gr.Blocks:
                 """
 ## Tips for best results
 
-### Detector backends
-- **`sam3_video`** (default) — SAM3's CLIP+DETR detector, ~6 GB VRAM. Use short standard nouns: `person`, `forklift`, `fire extinguisher`.
-- **`qwen`** — Qwen VL detector + SAM3 masks, ~18 GB VRAM. Use specific visual descriptions: `"red fire extinguisher"`, `"wooden pallet"`.
+### Class names
+- Use short, standard nouns: `person`, `forklift`, `fire extinguisher`
+- SAM3 uses CLIP text embeddings — the closer your class name is to ImageNet-style labels, the better
 
 ### Confidence threshold
-- **sam3_video**: start at `0.03`, lower to `0.01` for more recall, raise to `0.08` to cut false positives
-- **qwen**: start at `0.25`, lower to `0.1` for more recall, raise to `0.5` to cut false positives
+- Start at `0.03`, lower to `0.01` for more recall, raise to `0.08` to cut false positives
+- Each image will show different optimal values depending on object density
 
-### SAM score threshold
-- **sam3_video**: keep at `0.0` (score is the same as detection confidence)
-- **qwen**: `0.5` is a good default; lower to `0.3` for partially occluded objects
+### SAM mask quality score
+- Keep at `0.0` to retain all masks — the confidence threshold is the main filter
+- Raise to `0.5` only if you see many poor-quality masks (e.g. thin slivers)
 
 ### Visualization
-- Each class gets a distinct color from the palette
-- Overlapping masks from different classes both show through — the blend accumulates so you can see all instances
+- Each class gets a distinct colour from the palette
+- Overlapping masks from different classes both show through
 
 ### Batch processing
 - Images are processed one at a time (GPU memory constraint)
@@ -456,11 +450,7 @@ def build_app(config_path: str = None) -> gr.Blocks:
 - Visualizations are saved in `outputs/run_*/visualizations/`
 
 ### GPU memory
-| Backend | VRAM |
-|---|---|
-| sam3_video | ~6 GB |
-| qwen (bfloat16) | ~18 GB |
-| qwen (4-bit) | ~9 GB |
+~6 GB VRAM (SAM3 CLIP+DETR detector + mask decoder)
 """
             )
 
@@ -470,7 +460,7 @@ def build_app(config_path: str = None) -> gr.Blocks:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Qwen3VL → SAM Gradio GUI")
+    parser = argparse.ArgumentParser(description="SAM3 Gradio GUI")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--host", default="0.0.0.0")

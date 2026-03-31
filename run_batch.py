@@ -21,7 +21,7 @@ logging.basicConfig(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qwen VL → SAM batch segmentation pipeline",
+        description="SAM3 batch detection + segmentation pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def main():
         config.setdefault("pipeline", {})["sam_score_threshold"] = args.sam_score
 
     print(f"\n{'='*60}")
-    print(f"Qwen3VL → SAM Batch Processor")
+    print(f"SAM3 Batch Processor")
     print(f"Input:   {args.input}")
     print(f"Classes: {args.classes}")
     print(f"Config:  {args.config}")
