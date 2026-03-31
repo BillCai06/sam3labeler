@@ -1,4 +1,4 @@
-# qwen3vl2sam
+# Sam3Labler
 
 Auto-labeling pipeline: detect objects by class name → segment them → export **COCO JSON** ready for training or labeling review.
 
