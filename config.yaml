@@ -1,0 +1,79 @@
+models:
+  detector:
+    # --- Backend selection ---
+    # "qwen"       (default) Use Qwen VL for bounding-box detection + SAM for masks
+    # "sam3_video" Use SAM3's built-in CLIP+DETR detector — no Qwen needed, ~6 GB VRAM
+    backend: "sam3_video"
+
+    # --- SAM3 video detector settings (used when backend: "sam3_video") ---
+    sam3_local_path: "sam3"     # path to local SAM3 weights (same as segmentor)
+    score_threshold: 0.05       # raw DETR detection score; pipeline confidence_threshold does final filtering
+    new_det_thresh:  0.05       # SAM3 tracker new-object threshold
+
+    # --- Qwen VL settings (used when backend: "qwen") ---
+    model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+    device: "cuda"
+    dtype: "bfloat16"          # use "float16" for older GPUs without BF16
+    max_new_tokens: 2048
+    # quantization: "4bit"     # uncomment to reduce VRAM ~7GB (requires bitsandbytes)
+
+  segmentor:
+    backend: "sam3"            # "sam3" (recommended), "sam2", or "sam1"
+    # SAM3 (local weights — text-guided, drop-in SAM2 replacement, works on Blackwell GPUs)
+    sam3_local_path: "sam3"    # relative to project root
+    # SAM2 (auto-download from HuggingFace)
+    # NOTE: SAM2 requires PyTorch with CUDA sm_120 support for Blackwell GPUs.
+    # Upgrade: conda install pytorch pytorch-cuda=12.8 -c pytorch-nightly -c nvidia
+    sam2_model_id: "facebook/sam2-hiera-large"
+    # SAM1 (manual download required)
+    sam1_checkpoint: "checkpoints/sam_vit_h.pth"
+    sam1_model_type: "vit_h"   # "vit_h", "vit_l", "vit_b"
+    device: "cuda"
+    multimask_output: false    # single best mask per instance
+
+pipeline:
+  # sam3_video scores run 0.02–0.25; qwen scores run 0.5–0.95.
+  # Lower both thresholds when using backend: "sam3_video".
+  confidence_threshold: 0.03  # minimum detection confidence  (qwen: 0.25, sam3_video: 0.03)
+  nms_iou_threshold: 0.5      # NMS threshold for duplicate removal
+  use_box_prompt: true        # pass bbox to SAM (improves accuracy)
+  sam_score_threshold: 0.0    # minimum SAM mask quality  (qwen: 0.5, sam3_video: 0.0)
+
+classes:
+  # Default class list — override per run via CLI or GUI
+  - person
+  - car
+  - truck
+  - bicycle
+  - motorcycle
+  - bus
+  - traffic_light
+  - stop_sign
+  - dog
+  - cat
+  - chair
+  - table
+  - laptop
+  - phone
+  - bottle
+  - cup
+  - book
+  - bag
+  - plant
+  - door
+
+output:
+  dir: "outputs"
+  save_visualization: true
+  save_masks: false           # save individual PNG masks per instance
+  coco_format: true           # export COCO JSON for labeling tools
+  viz_alpha: 0.5              # mask overlay transparency
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+gui:
+  host: "0.0.0.0"
+  port: 7860
+  share: false
