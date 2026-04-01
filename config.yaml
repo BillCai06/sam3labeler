@@ -13,26 +13,30 @@ pipeline:
 
 classes:
   # Default class list — override per run via CLI or GUI
-  - person
+  - trail
+  - grass
+  - tree
+  - underbrush
+  - mulch
+  - log
+  - rock
+  - gravel
+  - mud
+  - water
+  - snow
+  - sky
+  - fence
+  - bush
+  - pole
+  - sign
+  - concrete
+  - asphalt
+  - building
+  - robot
   - car
-  - truck
-  - bicycle
-  - motorcycle
-  - bus
-  - traffic_light
-  - stop_sign
-  - dog
-  - cat
-  - chair
-  - table
-  - laptop
-  - phone
-  - bottle
-  - cup
-  - book
-  - bag
-  - plant
-  - door
+  - person
+  - animal
+  - other
 
 output:
   dir: "outputs"
