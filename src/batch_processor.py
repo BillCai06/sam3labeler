@@ -81,7 +81,8 @@ class BatchProcessor:
 
         # Set up output directory
         if output_dir is None:
-            output_dir = Path(self.out_cfg.get("dir", "outputs"))
+            base = input_path if input_path.is_dir() else input_path.parent
+            output_dir = base / self.out_cfg.get("dir", "outputs")
         output_dir = Path(output_dir)
         run_dir = output_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         viz_dir = run_dir / "visualizations"

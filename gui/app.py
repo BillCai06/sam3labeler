@@ -356,8 +356,8 @@ Detect objects by class name → segment → export COCO JSON
                             value=True, label="Save annotated visualizations"
                         )
                         output_dir_input = gr.Textbox(
-                            label="Output directory (leave blank for default)",
-                            placeholder=default_output_dir,
+                            label="Output directory (leave blank for <input_folder>/outputs/)",
+                            placeholder="default: <input_folder>/outputs/",
                         )
                     batch_btn = gr.Button(
                         "Start Batch Processing", variant="primary", size="lg"
