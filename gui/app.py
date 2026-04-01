@@ -288,7 +288,7 @@ Detect objects by class name → segment → export COCO JSON
             with gr.Row():
                 selected_classes = gr.CheckboxGroup(
                     choices=default_classes,
-                    value=default_classes[:5] if default_classes else [],
+                    value=default_classes,
                     label="Active classes for this run",
                 )
             with gr.Row():
@@ -391,19 +391,17 @@ Detect objects by class name → segment → export COCO JSON
             classes = [c.strip() for c in class_text.split("\n") if c.strip()]
             if not classes:
                 raise gr.Error("Class list cannot be empty.")
-            new_val = classes[:5]
             return (
-                gr.update(choices=classes, value=new_val),
-                gr.update(choices=classes, value=new_val),
+                gr.update(choices=classes, value=classes),
+                gr.update(choices=classes, value=classes),
             )
 
         def _reset_class_list():
             classes = default_classes
-            new_val = classes[:5]
             return (
                 "\n".join(classes),
-                gr.update(choices=classes, value=new_val),
-                gr.update(choices=classes, value=new_val),
+                gr.update(choices=classes, value=classes),
+                gr.update(choices=classes, value=classes),
             )
 
         apply_classes_btn.click(

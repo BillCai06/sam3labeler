@@ -13,38 +13,66 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# 20-color palette for class visualization (RGB)
+# Fixed per-class colors (RGB) — stable regardless of class_list order or length.
+# Unknown classes fall back to PALETTE via hash.
+CLASS_COLORS: dict[str, tuple] = {
+    "trail":      (194, 154, 108),  # tan
+    "grass":      ( 52, 199,  89),  # green
+    "tree":       ( 34, 139,  34),  # dark green
+    "underbrush": (107, 142,  35),  # olive
+    "mulch":      (101,  67,  33),  # dark brown
+    "log":        (139,  90,  43),  # medium brown
+    "rock":       (128, 128, 128),  # gray
+    "gravel":     (180, 180, 165),  # light gray
+    "mud":        (116,  92,  72),  # muddy brown
+    "water":      (  0, 122, 255),  # blue
+    "snow":       (200, 225, 255),  # icy white-blue
+    "sky":        (135, 206, 235),  # sky blue
+    "fence":      (205, 170, 100),  # tan-yellow
+    "bush":       ( 85, 160,  60),  # medium green
+    "pole":       ( 90,  90,  90),  # dark gray
+    "sign":       (255, 204,   0),  # yellow
+    "concrete":   (176, 196, 222),  # steel blue-gray
+    "asphalt":    ( 60,  60,  60),  # near-black gray
+    "building":   (210, 140,  80),  # orange-brown
+    "robot":      (  0, 210, 210),  # cyan
+    "car":        (255,  59,  48),  # red
+    "person":     (255,  45,  85),  # pink
+    "animal":     (255, 149,   0),  # orange
+    "other":      (175,  82, 222),  # purple
+}
+
+# Fallback palette for classes not listed above
 PALETTE = [
-    (255, 59,  48),   # red
-    (52,  199, 89),   # green
-    (0,   122, 255),  # blue
-    (255, 149, 0),    # orange
-    (175, 82,  222),  # purple
-    (255, 45,  85),   # pink
-    (90,  200, 250),  # light blue
-    (255, 204, 0),    # yellow
-    (100, 210, 255),  # cyan
-    (48,  209, 88),   # mint
-    (255, 55,  95),   # crimson
-    (0,   199, 190),  # teal
-    (255, 179, 64),   # amber
-    (191, 90,  242),  # violet
-    (100, 100, 255),  # indigo
-    (255, 69,  58),   # tomato
-    (50,  173, 230),  # sky
-    (255, 159, 10),   # tangerine
-    (172, 148, 248),  # lavender
-    (88,  86,  214),  # ultramarine
+    (255, 59,  48),
+    (52,  199, 89),
+    (0,   122, 255),
+    (255, 149, 0),
+    (175, 82,  222),
+    (255, 45,  85),
+    (90,  200, 250),
+    (255, 204, 0),
+    (100, 210, 255),
+    (48,  209, 88),
+    (255, 55,  95),
+    (0,   199, 190),
+    (255, 179, 64),
+    (191, 90,  242),
+    (100, 100, 255),
+    (255, 69,  58),
+    (50,  173, 230),
+    (255, 159, 10),
+    (172, 148, 248),
+    (88,  86,  214),
 ]
 
 
-def get_class_color(class_name: str, class_list: list[str]) -> tuple:
-    """Get a consistent color for a class name."""
-    try:
-        idx = class_list.index(class_name)
-    except ValueError:
-        idx = hash(class_name) % len(PALETTE)
-    return PALETTE[idx % len(PALETTE)]
+def get_class_color(class_name: str, class_list: list[str] = None) -> tuple:
+    """Get a fixed color for a class name. class_list is kept for API compatibility."""
+    if class_name in CLASS_COLORS:
+        return CLASS_COLORS[class_name]
+    # Unknown class: deterministic hash so it's still stable across runs
+    return PALETTE[hash(class_name) % len(PALETTE)]
 
 
 def visualize_results(
