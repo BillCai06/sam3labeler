@@ -82,7 +82,16 @@ class BatchProcessor:
         # Set up output directory
         if output_dir is None:
             base = input_path if input_path.is_dir() else input_path.parent
-            output_dir = base / self.out_cfg.get("dir", "outputs")
+            candidate = base / self.out_cfg.get("dir", "outputs")
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                output_dir = candidate
+            except PermissionError:
+                fallback = Path(self.out_cfg.get("dir", "outputs"))
+                logger.warning(
+                    f"No write permission for {candidate}, falling back to {fallback.resolve()}"
+                )
+                output_dir = fallback
         output_dir = Path(output_dir)
         run_dir = output_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         viz_dir = run_dir / "visualizations"

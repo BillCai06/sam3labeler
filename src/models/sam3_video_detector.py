@@ -54,6 +54,7 @@ class Sam3VideoDetector:
         self.model = None
         self.processor = None
         self._tracker_processor = None
+        self._token_cache: dict[str, tuple] = {}  # class_name → (input_ids, attention_mask)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -139,14 +140,19 @@ class Sam3VideoDetector:
             inference_state_device=self.device,
         )
 
-        # Tokenize and register each class as a text prompt
+        # Tokenize and register each class as a text prompt (tokens cached across images)
         for cls in classes:
             prompt_id = session.add_prompt(cls)
-            tokens = self.processor.tokenizer(
-                cls, return_tensors="pt", padding="max_length", max_length=32
-            )
-            session.prompt_input_ids[prompt_id] = tokens.input_ids.to(self.device)
-            session.prompt_attention_masks[prompt_id] = tokens.attention_mask.to(self.device)
+            if cls not in self._token_cache:
+                tokens = self.processor.tokenizer(
+                    cls, return_tensors="pt", padding="max_length", max_length=32
+                )
+                self._token_cache[cls] = (
+                    tokens.input_ids.to(self.device),
+                    tokens.attention_mask.to(self.device),
+                )
+            session.prompt_input_ids[prompt_id] = self._token_cache[cls][0]
+            session.prompt_attention_masks[prompt_id] = self._token_cache[cls][1]
 
         with torch.inference_mode():
             out = self.model(inference_session=session, frame_idx=0)
@@ -189,12 +195,15 @@ class Sam3VideoDetector:
             return None, [0.0, 0.0, 1.0, 1.0]
 
         # post_process_masks expects [batch, num_objects, num_masks, H, W]
-        masks_up = self._tracker_processor.post_process_masks(
-            raw_mask.unsqueeze(0).unsqueeze(0).cpu(),  # [1,1,1,288,288]
-            original_sizes=[[img_h, img_w]],
-            binarize=True,
-        )
-        mask_np = masks_up[0][0, 0].numpy().astype(bool)  # (H, W)
+        # Keep on GPU until the final numpy conversion to avoid repeated transfers
+        import torch.nn.functional as F
+        mask_up = F.interpolate(
+            raw_mask.unsqueeze(0).float(),  # [1, 1, 288, 288]
+            size=(img_h, img_w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]  # (H, W)
+        mask_np = (mask_up > 0).cpu().numpy().astype(bool)
 
         # Derive tight bounding box from mask pixels
         rows = np.any(mask_np, axis=1)
