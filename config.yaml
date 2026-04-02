@@ -35,9 +35,9 @@ models:
   detector:
     backend: image
     device: cuda
-    new_det_thresh: 0.05
+    new_det_thresh: 0.4
     sam3_local_path: sam3
-    score_threshold: 0.05
+    score_threshold: 0.4
 output:
   coco_format: true
   dir: outputs
@@ -46,6 +46,6 @@ output:
   viz_alpha: 0.5
 pipeline:
   confidence_threshold: 0.03
+  inference_batch_size: 16
   nms_iou_threshold: 0.5
   sam_score_threshold: 0.0
-  inference_batch_size: 8    # images per GPU batch (image backend only); raise if VRAM allows

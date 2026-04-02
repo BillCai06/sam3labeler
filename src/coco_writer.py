@@ -143,6 +143,14 @@ class COCOWriter:
                 )
         return image_id
 
+    def load(self, path: str | Path):
+        """Load an existing COCO JSON to resume accumulation."""
+        with open(path) as f:
+            data = json.load(f)
+        self._images = data.get("images", [])
+        self._annotations = data.get("annotations", [])
+        self._ann_id = max((a["id"] for a in self._annotations), default=0) + 1
+
     def to_dict(self) -> dict:
         """Return the complete COCO JSON as a dict."""
         categories = [

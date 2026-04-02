@@ -1,5 +1,12 @@
 """
 Batch processing: run the pipeline over a folder of images, save results.
+
+Output directory naming:
+    <input_dir>/<parent_name>_<input_name>/
+    e.g. drone_frames/ → drone_frames/sensor_record_20260318_140904_dataset_drone_frames/
+
+Resume: if checkpoint.json exists in the output dir, already-processed images are skipped.
+Delete checkpoint.json (or the whole output dir) to start fresh.
 """
 
 import json
@@ -9,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
@@ -22,17 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class BatchProcessor:
-    """
-    Processes a folder of images through the SAM3 pipeline.
-
-    When the image backend is active, images are processed in GPU batches
-    (batch_size from config, default 8) for maximum throughput.
-
-    Outputs (in output_dir/run_TIMESTAMP/):
-        annotations.json     — COCO format with all instances
-        visualizations/      — annotated images with mask overlays
-        summary.json         — run stats (images, annotations, errors)
-    """
 
     def __init__(self, pipeline: Pipeline, config: dict):
         self.pipeline = pipeline
@@ -56,6 +51,7 @@ class BatchProcessor:
         progress_callback=None,
     ) -> dict:
         input_path = Path(input_path)
+        input_dir = input_path if input_path.is_dir() else input_path.parent
 
         if input_path.is_file():
             image_paths = [input_path]
@@ -67,83 +63,102 @@ class BatchProcessor:
         if not image_paths:
             raise ValueError(f"No images found in {input_path}")
 
-        logger.info(f"Processing {len(image_paths)} images, classes: {active_classes}")
-
-        # Set up output directory
-        if output_dir is None:
-            base = input_path if input_path.is_dir() else input_path.parent
-            candidate = base / self.out_cfg.get("dir", "outputs")
-            try:
-                candidate.mkdir(parents=True, exist_ok=True)
-                _test = candidate / ".write_test"
-                _test.touch()
-                _test.unlink()
-                output_dir = candidate
-            except OSError:
-                fallback = Path(__file__).parent.parent / self.out_cfg.get("dir", "outputs")
-                logger.warning(
-                    f"No write permission for {candidate}, falling back to {fallback.resolve()}"
-                )
-                output_dir = fallback
-        output_dir = Path(output_dir)
-        run_dir = output_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # ── Output directory ──────────────────────────────────────────
+        run_dir, actual_location = self._resolve_output_dir(input_dir, output_dir)
         viz_dir = run_dir / "visualizations"
+        json_dir = run_dir / "annotations"
 
         if save_viz:
             viz_dir.mkdir(parents=True, exist_ok=True)
-        else:
+        if save_coco:
+            json_dir.mkdir(parents=True, exist_ok=True)
+        if not save_viz and not save_coco:
             run_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Resume: load checkpoint ───────────────────────────────────
+        checkpoint_path = run_dir / "checkpoint.json"
+        done_set: set[str] = set()
+        if checkpoint_path.exists():
+            try:
+                cp = json.loads(checkpoint_path.read_text())
+                done_set = set(cp.get("done", []))
+                logger.info(f"Resuming: {len(done_set)}/{len(image_paths)} images already done")
+            except Exception:
+                logger.warning("Could not read checkpoint.json, starting fresh")
+
+        remaining = [p for p in image_paths if p.name not in done_set]
+        skipped = len(image_paths) - len(remaining)
+
+        logger.info(
+            f"Processing {len(remaining)} images "
+            f"({skipped} skipped / already done), classes: {active_classes}"
+        )
 
         summary = {
             "total_images": len(image_paths),
+            "skipped": skipped,
             "processed": 0,
             "failed": 0,
             "total_annotations": 0,
             "errors": [],
             "output_dir": str(run_dir),
-            "coco_path": str(run_dir / "annotations") if save_coco else None,
+            "output_location": actual_location,
+            "coco_path": str(run_dir / "annotations.json") if save_coco else None,
         }
 
+        if not remaining:
+            logger.info("All images already processed.")
+            self._print_summary(summary)
+            return summary
+
         viz_alpha = self.out_cfg.get("viz_alpha", 0.5)
+
+        # Load existing combined COCO if resuming
         combined_writer = COCOWriter(active_classes) if save_coco else None
+        combined_json = run_dir / "annotations.json"
+        if save_coco and combined_json.exists() and done_set:
+            try:
+                combined_writer.load(combined_json)
+            except Exception:
+                pass  # corrupt combined JSON — will be rebuilt from per-image files
 
         use_batched = isinstance(self.pipeline.detector, Sam3ImageDetector)
         batch_size = self.inference_batch_size if use_batched else 1
-        logger.info(
-            f"Inference mode: {'batched (image backend), batch_size=' + str(batch_size) if use_batched else 'sequential (video backend)'}"
-        )
 
-        total = len(image_paths)
+        total_remaining = len(remaining)
         processed_count = 0
 
-        with tqdm(total=total, desc="Processing images") as pbar:
-            for batch_start in range(0, total, batch_size):
-                batch_paths = image_paths[batch_start: batch_start + batch_size]
+        with tqdm(total=total_remaining, desc="Processing images") as pbar:
+            for batch_start in range(0, total_remaining, batch_size):
+                batch_paths = remaining[batch_start: batch_start + batch_size]
 
                 if use_batched:
-                    self._run_image_batch(
+                    newly_done = self._run_image_batch(
                         batch_paths, active_classes,
-                        run_dir, viz_dir, viz_alpha,
+                        run_dir, viz_dir, json_dir, viz_alpha,
                         save_coco, save_viz,
                         combined_writer, summary,
-                        progress_callback, processed_count, total,
+                        progress_callback, skipped + processed_count, len(image_paths),
                     )
                 else:
-                    self._run_single(
+                    newly_done = self._run_single(
                         batch_paths[0], active_classes,
-                        run_dir, viz_dir, viz_alpha,
+                        run_dir, viz_dir, json_dir, viz_alpha,
                         save_coco, save_viz,
                         combined_writer, summary,
-                        progress_callback, processed_count, total,
+                        progress_callback, skipped + processed_count, len(image_paths),
                     )
+
+                done_set.update(newly_done)
+                self._save_checkpoint(checkpoint_path, done_set, len(image_paths))
 
                 processed_count += len(batch_paths)
                 pbar.update(len(batch_paths))
 
+        # ── Finalise ──────────────────────────────────────────────────
         if save_coco:
-            combined_path = run_dir / "annotations.json"
-            combined_writer.save(combined_path)
-            summary["coco_path"] = str(combined_path)
+            combined_writer.save(combined_json)
+            summary["coco_path"] = str(combined_json)
             summary["coco_summary"] = combined_writer.summary()
 
         summary_path = run_dir / "summary.json"
@@ -151,23 +166,70 @@ class BatchProcessor:
             json.dump(summary, f, indent=2)
 
         if progress_callback:
-            progress_callback(total, total, "Done")
+            progress_callback(len(image_paths), len(image_paths), "Done")
 
         self._print_summary(summary)
         return summary
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Output directory resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_output_dir(
+        self,
+        input_dir: Path,
+        output_dir_override: Optional[str | Path],
+    ) -> tuple[Path, str]:
+        """
+        Returns (run_dir, location_label).
+        location_label is "usb" or "local_fallback" — shown in GUI.
+        """
+        if output_dir_override is not None:
+            d = Path(output_dir_override)
+            d.mkdir(parents=True, exist_ok=True)
+            return d, "custom"
+
+        folder_name = f"{input_dir.parent.name}_{input_dir.name}"
+        candidate = input_dir / folder_name
+
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            _test = candidate / ".write_test"
+            _test.touch()
+            _test.unlink()
+            return candidate, "usb"
+        except OSError:
+            fallback = Path(__file__).parent.parent / "outputs" / folder_name
+            fallback.mkdir(parents=True, exist_ok=True)
+            logger.warning(
+                f"⚠ Cannot write to {candidate} (USB permission denied).\n"
+                f"  Falling back to: {fallback.resolve()}\n"
+                f"  Fix: sudo umount /mnt/usbssd && sudo mount -t exfat /dev/sda1 /mnt/usbssd "
+                f"-o uid=1000,gid=1000,fmask=0133,dmask=0022,iocharset=utf8,errors=remount-ro"
+            )
+            return fallback, "local_fallback"
+
+    # ------------------------------------------------------------------
+    # Checkpoint
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _save_checkpoint(path: Path, done_set: set, total: int):
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"done": sorted(done_set), "total": total}, indent=2))
+        tmp.replace(path)  # atomic rename
+
+    # ------------------------------------------------------------------
+    # Batched inference (image backend)
     # ------------------------------------------------------------------
 
     def _run_image_batch(
         self, paths, active_classes,
-        run_dir, viz_dir, viz_alpha,
-        save_coco, save_viz,
-        combined_writer, summary,
+        run_dir, viz_dir, json_dir, viz_alpha,
+        save_coco, save_viz, combined_writer, summary,
         progress_callback, processed_so_far, total,
-    ):
-        """Load and process a batch of images using Sam3ImageDetector.detect_and_segment_batch."""
+    ) -> list[str]:
+        """Returns list of successfully processed image names."""
         images, loaded_paths = [], []
         for p in paths:
             try:
@@ -175,17 +237,16 @@ class BatchProcessor:
                 loaded_paths.append(p)
             except Exception as e:
                 summary["failed"] += 1
-                summary["errors"].append(f"{p.name}: {e}")
-                logger.error(f"Failed to load {p}: {e}")
+                summary["errors"].append(f"{p.name}: load error: {e}")
 
         if not images:
-            return
+            return []
 
         if progress_callback:
-            progress_callback(
-                processed_so_far, total,
-                f"Processing {loaded_paths[0].name}" + (f" (+{len(loaded_paths)-1} more)" if len(loaded_paths) > 1 else ""),
-            )
+            label = loaded_paths[0].name
+            if len(loaded_paths) > 1:
+                label += f" (+{len(loaded_paths)-1} more)"
+            progress_callback(processed_so_far, total, f"Processing {label}")
 
         try:
             batch_results = self.pipeline.detector.detect_and_segment_batch(
@@ -197,10 +258,10 @@ class BatchProcessor:
             for p in loaded_paths:
                 summary["failed"] += 1
                 summary["errors"].append(f"{p.name}: batch error: {e}")
-            return
+            return []
 
         from .utils import apply_nms
-        json_dir = run_dir / "annotations"
+        newly_done = []
 
         for img_path, image, raw_results in zip(loaded_paths, images, batch_results):
             try:
@@ -213,7 +274,6 @@ class BatchProcessor:
                 if save_coco:
                     per_writer = COCOWriter(active_classes)
                     per_writer.add_image_results(img_path.name, results, img_w, img_h)
-                    json_dir.mkdir(parents=True, exist_ok=True)
                     per_writer.save(json_dir / f"{img_path.stem}.json")
                     combined_writer.add_image_results(img_path.name, results, img_w, img_h)
 
@@ -223,31 +283,34 @@ class BatchProcessor:
 
                 summary["processed"] += 1
                 summary["total_annotations"] += len(results)
+                newly_done.append(img_path.name)
 
             except Exception as e:
-                logger.error(f"Failed to save results for {img_path}: {traceback.format_exc()}")
+                logger.error(f"Failed saving {img_path.name}: {traceback.format_exc()}")
                 summary["failed"] += 1
                 summary["errors"].append(f"{img_path.name}: {e}")
 
+        return newly_done
+
+    # ------------------------------------------------------------------
+    # Sequential (video backend)
+    # ------------------------------------------------------------------
+
     def _run_single(
         self, img_path, active_classes,
-        run_dir, viz_dir, viz_alpha,
-        save_coco, save_viz,
-        combined_writer, summary,
+        run_dir, viz_dir, json_dir, viz_alpha,
+        save_coco, save_viz, combined_writer, summary,
         progress_callback, processed_so_far, total,
-    ):
-        """Process one image (video backend fallback)."""
+    ) -> list[str]:
         if progress_callback:
             progress_callback(processed_so_far, total, f"Processing {img_path.name}")
         try:
             image, results = self.pipeline.process_image_path(img_path, active_classes)
             img_w, img_h = image.size
 
-            json_dir = run_dir / "annotations"
             if save_coco:
                 per_writer = COCOWriter(active_classes)
                 per_writer.add_image_results(img_path.name, results, img_w, img_h)
-                json_dir.mkdir(parents=True, exist_ok=True)
                 per_writer.save(json_dir / f"{img_path.stem}.json")
                 combined_writer.add_image_results(img_path.name, results, img_w, img_h)
 
@@ -257,15 +320,25 @@ class BatchProcessor:
 
             summary["processed"] += 1
             summary["total_annotations"] += len(results)
+            return [img_path.name]
 
         except Exception as e:
             logger.error(f"Failed to process {img_path}: {traceback.format_exc()}")
             summary["failed"] += 1
             summary["errors"].append(f"{img_path.name}: {e}")
+            return []
+
+    # ------------------------------------------------------------------
 
     def _print_summary(self, summary: dict):
         print(f"\n{'='*50}")
         print(f"Batch complete: {summary['processed']}/{summary['total_images']} images")
+        if summary.get("skipped"):
+            print(f"Skipped (already done): {summary['skipped']}")
+        if summary.get("output_location") == "local_fallback":
+            print(f"⚠ Output saved LOCALLY (USB not writable): {summary['output_dir']}")
+        else:
+            print(f"Output: {summary['output_dir']}")
         print(f"Total annotations: {summary['total_annotations']}")
         if summary.get("coco_summary"):
             for cls, count in sorted(summary["coco_summary"].get("classes", {}).items()):
@@ -274,5 +347,4 @@ class BatchProcessor:
             print(f"Failures: {summary['failed']}")
             for e in summary["errors"][:5]:
                 print(f"  - {e}")
-        print(f"Output: {summary['output_dir']}")
         print(f"{'='*50}\n")

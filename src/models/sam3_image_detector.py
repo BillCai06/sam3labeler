@@ -135,7 +135,8 @@ class Sam3ImageDetector:
 
         for cls in classes:
             # text_embeds shape (1, hidden_dim) — model auto-broadcasts to batch N
-            text_embeds = self._text_embed_cache[cls]
+            # text_embeds cached as (1, hidden_dim); expand to match image batch
+            text_embeds = self._text_embed_cache[cls].expand(N, -1, -1)
 
             with torch.inference_mode():
                 out = self.model(
@@ -188,7 +189,7 @@ class Sam3ImageDetector:
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
                     return_dict=True,
-                ).pooler_output  # (1, hidden_dim)
+                ).pooler_output  # (1, seq_len, 256) — projected, matches k_proj input dim
             self._text_embed_cache[cls] = embed
 
     def _upscale_mask(self, raw_mask: torch.Tensor, img_h: int, img_w: int) -> np.ndarray:

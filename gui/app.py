@@ -197,11 +197,15 @@ def run_batch(
         progress_callback=prog_cb,
     )
 
+    loc = summary.get("output_location", "")
+    loc_warn = "\n⚠ USB not writable — saved LOCALLY (run: sudo umount /mnt/usbssd && sudo mount -t exfat /dev/sda1 /mnt/usbssd -o uid=1000,gid=1000,fmask=0133,dmask=0022,iocharset=utf8,errors=remount-ro)" if loc == "local_fallback" else ""
+
     lines = [
-        f"✓ Batch complete!",
-        f"  Processed: {summary['processed']}/{summary['total_images']} images",
+        f"✓ Batch complete!{loc_warn}",
+        f"  Processed: {summary['processed']}/{summary['total_images']} images"
+        + (f"  ({summary['skipped']} skipped/resumed)" if summary.get("skipped") else ""),
         f"  Annotations: {summary['total_annotations']}",
-        f"  Output dir: {summary['output_dir']}",
+        f"  Output: {summary['output_dir']}",
     ]
     if summary.get("coco_summary", {}).get("classes"):
         lines.append("\nClass breakdown:")
