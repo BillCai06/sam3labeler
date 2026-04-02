@@ -48,3 +48,4 @@ pipeline:
   confidence_threshold: 0.03
   nms_iou_threshold: 0.5
   sam_score_threshold: 0.0
+  inference_batch_size: 8    # images per GPU batch (image backend only); raise if VRAM allows

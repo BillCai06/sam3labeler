@@ -2,8 +2,12 @@
 SAM3 image-mode detector backend.
 
 Uses Sam3Model directly (no video InferenceSession / tracker overhead).
-Vision embeddings are computed once per image and reused across all classes.
-Text embeddings are cached across images.
+
+Key optimisations:
+  - Vision encoder runs once per image (or once per batch of images)
+  - Text embeddings are cached across images
+  - detect_and_segment_batch() processes N images in a single GPU forward pass
+    per class, exploiting spare VRAM (e.g. 93 GB free on RTX PRO 6000 Black)
 
 Same result format as Sam3VideoDetector:
     [{"class", "bbox", "confidence", "mask", "sam_score"}, ...]
@@ -24,8 +28,8 @@ class Sam3ImageDetector:
     """
     Detect and segment objects using Sam3Model (image backend).
 
-    Faster than the video backend because it skips the SAM3 tracker
-    (propagation, planning, execution) that is only useful for video.
+    Faster than the video backend because it skips the SAM3 tracker.
+    Supports batched inference across multiple images simultaneously.
     """
 
     def __init__(
@@ -40,7 +44,7 @@ class Sam3ImageDetector:
 
         self.model = None
         self.processor = None
-        self._text_embed_cache: dict[str, torch.Tensor] = {}  # class → pooled text embed
+        self._text_embed_cache: dict[str, torch.Tensor] = {}  # class → (1, hidden_dim)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -78,7 +82,7 @@ class Sam3ImageDetector:
         logger.info("Sam3ImageDetector unloaded")
 
     # ------------------------------------------------------------------
-    # Inference
+    # Single-image inference (used by GUI single-image tab)
     # ------------------------------------------------------------------
 
     def detect_and_segment(
@@ -87,34 +91,50 @@ class Sam3ImageDetector:
         classes: list[str],
         confidence_threshold: float = 0.25,
     ) -> list[dict]:
+        return self.detect_and_segment_batch([image], classes, confidence_threshold)[0]
+
+    # ------------------------------------------------------------------
+    # Batched inference (N images, all classes, one forward pass per class)
+    # ------------------------------------------------------------------
+
+    def detect_and_segment_batch(
+        self,
+        images: list[Image.Image],
+        classes: list[str],
+        confidence_threshold: float = 0.25,
+    ) -> list[list[dict]]:
+        """
+        Process N images simultaneously.
+
+        Args:
+            images: list of PIL RGB images (can be different sizes).
+            classes: class names to detect.
+            confidence_threshold: keep detections at or above this score.
+
+        Returns:
+            list of length N; each element is the result list for that image.
+        """
         if self.model is None:
             self.load()
 
-        W, H = image.size
+        N = len(images)
+        sizes = [(img.size[1], img.size[0]) for img in images]  # (H, W) per image
         dtype = next(self.model.parameters()).dtype
 
-        # Vision encoding — once per image
-        img_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        # Batch vision encoding — one forward pass for all N images
+        img_inputs = self.processor(images=images, return_tensors="pt").to(self.device)
         with torch.inference_mode():
             vision_embeds = self.model.get_vision_features(
                 pixel_values=img_inputs["pixel_values"].to(dtype)
             )
 
-        results = []
+        # Ensure text cache is warm for all classes before the main loop
+        self._cache_text_embeds(classes)
+
+        batch_results: list[list[dict]] = [[] for _ in range(N)]
 
         for cls in classes:
-            # Text embedding — cached across images
-            if cls not in self._text_embed_cache:
-                tokens = self.processor.tokenizer(
-                    cls, return_tensors="pt", padding="max_length", max_length=32
-                ).to(self.device)
-                with torch.inference_mode():
-                    text_embeds = self.model.get_text_features(
-                        input_ids=tokens.input_ids,
-                        attention_mask=tokens.attention_mask,
-                        return_dict=True,
-                    ).pooler_output  # (1, hidden_dim)
-                self._text_embed_cache[cls] = text_embeds
+            # text_embeds shape (1, hidden_dim) — model auto-broadcasts to batch N
             text_embeds = self._text_embed_cache[cls]
 
             with torch.inference_mode():
@@ -123,43 +143,58 @@ class Sam3ImageDetector:
                     text_embeds=text_embeds,
                 )
 
-            # pred_logits: (batch, num_queries) or (batch, num_queries, 1)
-            # presence_logits: (batch, 1)
+            # pred_logits: (N, num_queries) or (N, num_queries, 1)
+            # presence_logits: (N, 1)
             logits = out.pred_logits.sigmoid()
             if logits.dim() == 3:
-                logits = logits[..., 0]  # (batch, num_queries)
-            scores = (logits * out.presence_logits.sigmoid())[0]  # (num_queries,)
+                logits = logits[..., 0]                     # (N, num_queries)
+            scores = logits * out.presence_logits.sigmoid() # (N, num_queries)
 
-            above = (scores >= confidence_threshold).nonzero(as_tuple=False).squeeze(-1)
-            if above.numel() == 0:
-                continue
+            for i in range(N):
+                H, W = sizes[i]
+                img_scores = scores[i]                      # (num_queries,)
+                above = (img_scores >= confidence_threshold).nonzero(as_tuple=False).view(-1)
+                for qi in above.tolist():
+                    score = float(img_scores[qi])
+                    mask_np = self._upscale_mask(out.pred_masks[i, qi], H, W)
+                    bbox = out.pred_boxes[i, qi].tolist()
+                    batch_results[i].append({
+                        "class": cls,
+                        "bbox": bbox,
+                        "confidence": score,
+                        "mask": mask_np,
+                        "sam_score": score,
+                    })
 
-            for qi in above.tolist():
-                score = float(scores[qi])
-                raw_mask = out.pred_masks[0, qi]   # (H_low, W_low)
-                bbox_xyxy = out.pred_boxes[0, qi].tolist()  # [x1,y1,x2,y2] normalised
-
-                mask_np = self._upscale_mask(raw_mask, H, W)
-
-                results.append({
-                    "class": cls,
-                    "bbox": bbox_xyxy,
-                    "confidence": score,
-                    "mask": mask_np,
-                    "sam_score": score,
-                })
-
-        logger.info(f"Sam3ImageDetector: {len(results)} detections above threshold")
-        return results
+        total = sum(len(r) for r in batch_results)
+        logger.info(f"Sam3ImageDetector batch={N}: {total} detections above threshold")
+        return batch_results
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    def _cache_text_embeds(self, classes: list[str]):
+        """Tokenize and encode any classes not yet in the cache."""
+        missing = [cls for cls in classes if cls not in self._text_embed_cache]
+        if not missing:
+            return
+        for cls in missing:
+            tokens = self.processor.tokenizer(
+                cls, return_tensors="pt", padding="max_length", max_length=32
+            ).to(self.device)
+            with torch.inference_mode():
+                embed = self.model.get_text_features(
+                    input_ids=tokens.input_ids,
+                    attention_mask=tokens.attention_mask,
+                    return_dict=True,
+                ).pooler_output  # (1, hidden_dim)
+            self._text_embed_cache[cls] = embed
+
     def _upscale_mask(self, raw_mask: torch.Tensor, img_h: int, img_w: int) -> np.ndarray:
         """Bilinear upscale low-res mask logits to original resolution on GPU."""
         mask_up = F.interpolate(
-            raw_mask.float().unsqueeze(0).unsqueeze(0),  # (1,1,H_low,W_low)
+            raw_mask.float().unsqueeze(0).unsqueeze(0),  # (1, 1, H_low, W_low)
             size=(img_h, img_w),
             mode="bilinear",
             align_corners=False,
