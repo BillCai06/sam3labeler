@@ -9,6 +9,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
+from .models.sam3_image_detector import Sam3ImageDetector
 from .models.sam3_video_detector import Sam3VideoDetector
 from .utils import apply_nms, load_config
 
@@ -41,12 +42,21 @@ class Pipeline:
         self.nms_iou_threshold = pipe_cfg.get("nms_iou_threshold", 0.5)
         self.sam_score_threshold = pipe_cfg.get("sam_score_threshold", 0.0)
 
-        self.detector = Sam3VideoDetector(
-            sam3_local_path=det_cfg.get("sam3_local_path", "sam3"),
-            device=det_cfg.get("device", "cuda"),
-            score_threshold=det_cfg.get("score_threshold", 0.05),
-            new_det_thresh=det_cfg.get("new_det_thresh", 0.05),
-        )
+        backend = det_cfg.get("backend", "video")
+        if backend == "image":
+            self.detector = Sam3ImageDetector(
+                sam3_local_path=det_cfg.get("sam3_local_path", "sam3"),
+                device=det_cfg.get("device", "cuda"),
+                score_threshold=det_cfg.get("score_threshold", 0.05),
+            )
+        else:
+            self.detector = Sam3VideoDetector(
+                sam3_local_path=det_cfg.get("sam3_local_path", "sam3"),
+                device=det_cfg.get("device", "cuda"),
+                score_threshold=det_cfg.get("score_threshold", 0.05),
+                new_det_thresh=det_cfg.get("new_det_thresh", 0.05),
+            )
+        self.backend = backend
 
     @classmethod
     def from_config_file(cls, config_path: str = "config.yaml") -> "Pipeline":

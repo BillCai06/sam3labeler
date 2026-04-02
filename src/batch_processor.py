@@ -85,9 +85,13 @@ class BatchProcessor:
             candidate = base / self.out_cfg.get("dir", "outputs")
             try:
                 candidate.mkdir(parents=True, exist_ok=True)
+                # Verify we can actually write (exfat may allow mkdir but deny file writes)
+                _test = candidate / ".write_test"
+                _test.touch()
+                _test.unlink()
                 output_dir = candidate
-            except PermissionError:
-                fallback = Path(self.out_cfg.get("dir", "outputs"))
+            except OSError:
+                fallback = Path(__file__).parent.parent / self.out_cfg.get("dir", "outputs")
                 logger.warning(
                     f"No write permission for {candidate}, falling back to {fallback.resolve()}"
                 )

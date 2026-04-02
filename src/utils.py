@@ -19,6 +19,7 @@ CLASS_COLORS: dict[str, tuple] = {
     "trail":      (194, 154, 108),  # tan
     "grass":      ( 52, 199,  89),  # green
     "tree":       ( 34, 139,  34),  # dark green
+    "branch":     ( 34, 139,  34),  # dark green (same as tree)
     "underbrush": (107, 142,  35),  # olive
     "mulch":      (101,  67,  33),  # dark brown
     "log":        (139,  90,  43),  # medium brown

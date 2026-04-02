@@ -67,7 +67,8 @@ def load_models(config_path: str) -> str:
         _pipeline.detector.load()
 
         _batch_proc = BatchProcessor(_pipeline, _config)
-        yield gr.update(value="✓ Models loaded successfully!", visible=True)
+        backend = _config.get("models", {}).get("detector", {}).get("backend", "video")
+        yield gr.update(value=f"✓ Models loaded successfully! (backend: {backend})", visible=True)
     except Exception as e:
         yield gr.update(value=f"✗ Error loading models: {e}", visible=True)
 
@@ -250,12 +251,35 @@ Detect objects by class name → segment → export COCO JSON
                     value=_config_path,
                     placeholder="path/to/config.yaml",
                 )
+            with gr.Column(scale=2):
+                backend_radio = gr.Radio(
+                    choices=["image", "video"],
+                    value=_config.get("models", {}).get("detector", {}).get("backend", "image"),
+                    label="Backend",
+                    info="image = faster (no tracker)  |  video = full SAM3 tracker",
+                )
             with gr.Column(scale=1):
                 load_btn = gr.Button("Load Models", variant="primary", size="lg")
         model_status = gr.Textbox(label="Model status", interactive=False, visible=True)
+
+        def _load_with_backend(config_path: str, backend: str):
+            # Patch backend into config before loading
+            import yaml
+            from pathlib import Path as _Path
+            try:
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f)
+                cfg.setdefault("models", {}).setdefault("detector", {})["backend"] = backend
+                # Write back so Pipeline reads the chosen backend
+                with open(config_path, "w") as f:
+                    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            except Exception:
+                pass
+            yield from load_models(config_path)
+
         load_btn.click(
-            fn=load_models,
-            inputs=[config_input],
+            fn=_load_with_backend,
+            inputs=[config_input, backend_radio],
             outputs=[model_status],
         )
 

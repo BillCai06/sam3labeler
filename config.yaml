@@ -1,55 +1,50 @@
-models:
-  detector:
-    # SAM3's built-in CLIP+DETR detector — single-pass detect + segment, ~6 GB VRAM
-    sam3_local_path: "sam3"     # path to local SAM3 weights directory
-    score_threshold: 0.05       # raw DETR detection score; pipeline confidence_threshold does final filtering
-    new_det_thresh:  0.05       # SAM3 tracker new-object threshold
-    device: "cuda"
-
-pipeline:
-  confidence_threshold: 0.03  # minimum detection confidence
-  nms_iou_threshold: 0.5      # NMS threshold for duplicate removal
-  sam_score_threshold: 0.0    # minimum SAM mask quality score
-
-classes:
-  # Default class list — override per run via CLI or GUI
-  - trail
-  - grass
-  - tree
-  - underbrush
-  - mulch
-  - log
-  - rock
-  - gravel
-  - mud
-  - water
-  - snow
-  - sky
-  - fence
-  - bush
-  - pole
-  - sign
-  - concrete
-  - asphalt
-  - building
-  - robot
-  - car
-  - person
-  - animal
-  - other
-
-output:
-  dir: "outputs"
-  save_visualization: true
-  save_masks: false           # save individual PNG masks per instance
-  coco_format: true           # export COCO JSON for labeling tools
-  viz_alpha: 0.5              # mask overlay transparency
-
 api:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8000
-
+classes:
+- trail
+- grass
+- tree
+- branch
+- underbrush
+- mulch
+- log
+- rock
+- gravel
+- mud
+- water
+- snow
+- sky
+- fence
+- bush
+- pole
+- sign
+- concrete
+- asphalt
+- building
+- robot
+- car
+- person
+- animal
+- other
 gui:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 7860
   share: false
+models:
+  detector:
+    backend: image
+    device: cuda
+    new_det_thresh: 0.05
+    sam3_local_path: sam3
+    score_threshold: 0.05
+output:
+  coco_format: true
+  dir: outputs
+  save_masks: false
+  save_visualization: true
+  viz_alpha: 0.5
+pipeline:
+  confidence_threshold: 0.03
+  nms_iou_threshold: 0.5
+  sam_score_threshold: 0.0
