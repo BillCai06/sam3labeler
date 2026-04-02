@@ -46,6 +46,6 @@ output:
   viz_alpha: 0.5
 pipeline:
   confidence_threshold: 0.03
-  inference_batch_size: 16
+  inference_batch_size: 1
   nms_iou_threshold: 0.5
   sam_score_threshold: 0.0

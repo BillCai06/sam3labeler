@@ -10,8 +10,12 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Reduce CUDA memory fragmentation — helps on 8 GB GPUs
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,7 +124,7 @@ def main():
     pipeline = Pipeline(config)
     batch = BatchProcessor(pipeline, config)
 
-    summary = batch.run(
+    summaries = batch.run_auto(
         input_path=args.input,
         active_classes=args.classes,
         output_dir=args.output,
@@ -128,10 +132,19 @@ def main():
         save_coco=not args.no_coco,
     )
 
-    if summary.get("coco_path"):
-        print(f"\nCOCO JSON: {summary['coco_path']}")
+    total_failed = sum(s["failed"] for s in summaries)
+    if len(summaries) > 1:
+        total_processed = sum(s["processed"] for s in summaries)
+        total_annotations = sum(s["total_annotations"] for s in summaries)
+        print(f"\n{'='*60}")
+        print(f"All folders done: {total_processed} images, {total_annotations} annotations")
+        if total_failed:
+            print(f"Failures across all folders: {total_failed}")
+        print(f"{'='*60}")
+    elif summaries and summaries[0].get("coco_path"):
+        print(f"\nCOCO JSON: {summaries[0]['coco_path']}")
 
-    return 0 if summary["failed"] == 0 else 1
+    return 0 if total_failed == 0 else 1
 
 
 if __name__ == "__main__":

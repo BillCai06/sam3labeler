@@ -1,6 +1,14 @@
 """
 Batch processing: run the pipeline over a folder of images, save results.
 
+Single-folder mode:
+    Pass a folder of images — output is written alongside the input folder.
+
+Multi-folder mode (auto):
+    Pass a parent directory that contains sub-folders of images.
+    Each sub-folder is processed independently; output goes into each sub-folder.
+    Use run_auto() to get this behaviour automatically.
+
 Output directory naming:
     <input_dir>/<parent_name>_<input_name>/
     e.g. drone_frames/ → drone_frames/sensor_record_20260318_140904_dataset_drone_frames/
@@ -327,6 +335,63 @@ class BatchProcessor:
             summary["failed"] += 1
             summary["errors"].append(f"{img_path.name}: {e}")
             return []
+
+    # ------------------------------------------------------------------
+
+    def run_auto(
+        self,
+        input_path: str | Path,
+        active_classes: list[str],
+        output_dir: Optional[str | Path] = None,
+        save_viz: bool = True,
+        save_coco: bool = True,
+        progress_callback=None,
+    ) -> list[dict]:
+        """
+        Smart entry point: auto-detects single-folder vs multi-folder layout.
+
+        - If input contains sub-directories that have images, each sub-dir is
+          processed independently and output is written into each sub-dir
+          (output_dir override is ignored in multi-folder mode so results stay
+          next to their source data).
+        - Otherwise falls back to plain run() on the input as-is.
+
+        Returns a list of summary dicts (one per folder processed).
+        Resume / checkpoint still works per-folder exactly as before.
+        """
+        input_path = Path(input_path)
+
+        if input_path.is_dir():
+            subdirs_with_images = sorted(
+                d for d in input_path.iterdir()
+                if d.is_dir() and get_image_paths(str(d))
+            )
+        else:
+            subdirs_with_images = []
+
+        if subdirs_with_images:
+            print(f"\nMulti-folder mode: {len(subdirs_with_images)} sub-folders found")
+            for d in subdirs_with_images:
+                n = len(get_image_paths(str(d)))
+                print(f"  {d.name}/  ({n} images)")
+            print()
+
+            summaries = []
+            for i, subdir in enumerate(subdirs_with_images):
+                print(f"[{i + 1}/{len(subdirs_with_images)}] {subdir.name}")
+                summary = self.run(
+                    input_path=subdir,
+                    active_classes=active_classes,
+                    output_dir=None,   # always write into each subdir
+                    save_viz=save_viz,
+                    save_coco=save_coco,
+                    progress_callback=progress_callback,
+                )
+                summaries.append(summary)
+            return summaries
+
+        # Single folder / single file — behave exactly as before
+        return [self.run(input_path, active_classes, output_dir, save_viz, save_coco, progress_callback)]
 
     # ------------------------------------------------------------------
 
