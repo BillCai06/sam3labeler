@@ -94,7 +94,7 @@ class BatchProcessor:
             except Exception:
                 logger.warning("Could not read checkpoint.json, starting fresh")
 
-        remaining = [p for p in image_paths if p.name not in done_set]
+        remaining = [p for p in image_paths if str(p.relative_to(input_dir)) not in done_set]
         skipped = len(image_paths) - len(remaining)
 
         logger.info(
@@ -147,6 +147,7 @@ class BatchProcessor:
                         save_coco, save_viz,
                         combined_writer, summary,
                         progress_callback, skipped + processed_count, len(image_paths),
+                        input_dir,
                     )
                 else:
                     newly_done = self._run_single(
@@ -155,6 +156,7 @@ class BatchProcessor:
                         save_coco, save_viz,
                         combined_writer, summary,
                         progress_callback, skipped + processed_count, len(image_paths),
+                        input_dir,
                     )
 
                 done_set.update(newly_done)
@@ -236,8 +238,9 @@ class BatchProcessor:
         run_dir, viz_dir, json_dir, viz_alpha,
         save_coco, save_viz, combined_writer, summary,
         progress_callback, processed_so_far, total,
+        input_dir=None,
     ) -> list[str]:
-        """Returns list of successfully processed image names."""
+        """Returns list of successfully processed image keys (relative paths)."""
         images, loaded_paths = [], []
         for p in paths:
             try:
@@ -245,7 +248,8 @@ class BatchProcessor:
                 loaded_paths.append(p)
             except Exception as e:
                 summary["failed"] += 1
-                summary["errors"].append(f"{p.name}: load error: {e}")
+                rel = str(p.relative_to(input_dir)) if input_dir else p.name
+                summary["errors"].append(f"{rel}: load error: {e}")
 
         if not images:
             return []
@@ -265,13 +269,17 @@ class BatchProcessor:
             logger.error(f"Batch inference failed: {traceback.format_exc()}")
             for p in loaded_paths:
                 summary["failed"] += 1
-                summary["errors"].append(f"{p.name}: batch error: {e}")
+                rel = str(p.relative_to(input_dir)) if input_dir else p.name
+                summary["errors"].append(f"{rel}: batch error: {e}")
             return []
 
         from .utils import apply_nms
         newly_done = []
 
         for img_path, image, raw_results in zip(loaded_paths, images, batch_results):
+            rel_key = str(img_path.relative_to(input_dir)) if input_dir else img_path.name
+            # Flatten subdirectory into stem for output filenames: drone_frames/0001.jpg → drone_frames_0001
+            flat_stem = rel_key.replace("/", "_").replace("\\", "_").rsplit(".", 1)[0]
             try:
                 results = apply_nms(raw_results, self.pipeline.nms_iou_threshold)
                 if self.pipeline.sam_score_threshold > 0:
@@ -281,22 +289,22 @@ class BatchProcessor:
 
                 if save_coco:
                     per_writer = COCOWriter(active_classes)
-                    per_writer.add_image_results(img_path.name, results, img_w, img_h)
-                    per_writer.save(json_dir / f"{img_path.stem}.json")
-                    combined_writer.add_image_results(img_path.name, results, img_w, img_h)
+                    per_writer.add_image_results(rel_key, results, img_w, img_h)
+                    per_writer.save(json_dir / f"{flat_stem}.json")
+                    combined_writer.add_image_results(rel_key, results, img_w, img_h)
 
                 if save_viz and results:
                     viz_img = visualize_results(image, results, active_classes, alpha=viz_alpha)
-                    viz_img.save(viz_dir / f"{img_path.stem}_annotated{img_path.suffix}")
+                    viz_img.save(viz_dir / f"{flat_stem}_annotated{img_path.suffix}")
 
                 summary["processed"] += 1
                 summary["total_annotations"] += len(results)
-                newly_done.append(img_path.name)
+                newly_done.append(rel_key)
 
             except Exception as e:
-                logger.error(f"Failed saving {img_path.name}: {traceback.format_exc()}")
+                logger.error(f"Failed saving {rel_key}: {traceback.format_exc()}")
                 summary["failed"] += 1
-                summary["errors"].append(f"{img_path.name}: {e}")
+                summary["errors"].append(f"{rel_key}: {e}")
 
         return newly_done
 
@@ -309,31 +317,34 @@ class BatchProcessor:
         run_dir, viz_dir, json_dir, viz_alpha,
         save_coco, save_viz, combined_writer, summary,
         progress_callback, processed_so_far, total,
+        input_dir=None,
     ) -> list[str]:
+        rel_key = str(img_path.relative_to(input_dir)) if input_dir else img_path.name
+        flat_stem = rel_key.replace("/", "_").replace("\\", "_").rsplit(".", 1)[0]
         if progress_callback:
-            progress_callback(processed_so_far, total, f"Processing {img_path.name}")
+            progress_callback(processed_so_far, total, f"Processing {rel_key}")
         try:
             image, results = self.pipeline.process_image_path(img_path, active_classes)
             img_w, img_h = image.size
 
             if save_coco:
                 per_writer = COCOWriter(active_classes)
-                per_writer.add_image_results(img_path.name, results, img_w, img_h)
-                per_writer.save(json_dir / f"{img_path.stem}.json")
-                combined_writer.add_image_results(img_path.name, results, img_w, img_h)
+                per_writer.add_image_results(rel_key, results, img_w, img_h)
+                per_writer.save(json_dir / f"{flat_stem}.json")
+                combined_writer.add_image_results(rel_key, results, img_w, img_h)
 
             if save_viz and results:
                 viz_img = visualize_results(image, results, active_classes, alpha=viz_alpha)
-                viz_img.save(viz_dir / f"{img_path.stem}_annotated{img_path.suffix}")
+                viz_img.save(viz_dir / f"{flat_stem}_annotated{img_path.suffix}")
 
             summary["processed"] += 1
             summary["total_annotations"] += len(results)
-            return [img_path.name]
+            return [rel_key]
 
         except Exception as e:
             logger.error(f"Failed to process {img_path}: {traceback.format_exc()}")
             summary["failed"] += 1
-            summary["errors"].append(f"{img_path.name}: {e}")
+            summary["errors"].append(f"{rel_key}: {e}")
             return []
 
     # ------------------------------------------------------------------

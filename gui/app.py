@@ -13,9 +13,11 @@ Run standalone:
 
 import json
 import os
+import queue
 import sys
 import tempfile
-import time
+import threading
+import traceback
 from pathlib import Path
 
 # Make project root importable
@@ -36,6 +38,26 @@ _pipeline: Pipeline | None = None
 _batch_proc: BatchProcessor | None = None
 _config: dict = {}
 _config_path: str = str(ROOT / "config.yaml")
+
+STATE_FILE = ROOT / "gui_state.json"
+
+
+def _load_state() -> dict:
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(state: dict):
+    try:
+        existing = _load_state()
+        existing.update(state)
+        STATE_FILE.write_text(json.dumps(existing, indent=2))
+    except Exception:
+        pass
 
 
 def _get_pipeline() -> Pipeline:
@@ -157,9 +179,10 @@ def run_batch(
     sam_score_threshold: float,
     save_viz: bool,
     output_dir: str,
-    progress: gr.Progress = gr.Progress(track_tqdm=True),
-) -> tuple:
-    """Run batch processing and return (log_text, coco_json_path)."""
+    batch_size: int,
+    progress: gr.Progress = gr.Progress(),
+):
+    """Run batch processing; generator — streams log updates to the UI."""
     text_classes = [c.strip() for c in classes_text.split(",") if c.strip()]
     active_classes = list(dict.fromkeys(selected_classes + text_classes))
 
@@ -173,52 +196,96 @@ def run_batch(
     batch = _get_batch_proc()
     batch.pipeline.confidence_threshold = confidence_threshold
     batch.pipeline.sam_score_threshold = sam_score_threshold
+    batch.inference_batch_size = max(1, int(batch_size))
 
     image_paths = get_image_paths(folder_path)
     if not image_paths:
         raise gr.Error(f"No images found in {folder_path}")
 
-    log_lines = [f"Starting batch: {len(image_paths)} images", f"Classes: {active_classes}", ""]
-    log_text = "\n".join(log_lines)
     out_dir = output_dir.strip() if output_dir.strip() else None
 
-    processed = [0]  # mutable for closure
+    # Persist inputs for next session
+    _save_state({
+        "folder_path": folder_path,
+        "output_dir": output_dir,
+        "save_viz": save_viz,
+        "batch_size": batch_size,
+        "confidence": confidence_threshold,
+        "sam_score": sam_score_threshold,
+    })
 
-    def prog_cb(current, total, msg):
-        processed[0] = current
-        progress(current / total if total > 0 else 0, desc=msg)
-
-    summary = batch.run(
-        input_path=folder_path,
-        active_classes=active_classes,
-        output_dir=out_dir,
-        save_viz=save_viz,
-        save_coco=True,
-        progress_callback=prog_cb,
-    )
-
-    loc = summary.get("output_location", "")
-    loc_warn = "\n⚠ USB not writable — saved LOCALLY (run: sudo umount /mnt/usbssd && sudo mount -t exfat /dev/sda1 /mnt/usbssd -o uid=1000,gid=1000,fmask=0133,dmask=0022,iocharset=utf8,errors=remount-ro)" if loc == "local_fallback" else ""
-
-    lines = [
-        f"✓ Batch complete!{loc_warn}",
-        f"  Processed: {summary['processed']}/{summary['total_images']} images"
-        + (f"  ({summary['skipped']} skipped/resumed)" if summary.get("skipped") else ""),
-        f"  Annotations: {summary['total_annotations']}",
-        f"  Output: {summary['output_dir']}",
+    log_lines = [
+        f"Starting batch: {len(image_paths)} images",
+        f"Classes: {active_classes}",
+        f"Batch size: {batch.inference_batch_size}",
+        "",
     ]
-    if summary.get("coco_summary", {}).get("classes"):
-        lines.append("\nClass breakdown:")
-        for cls, count in sorted(summary["coco_summary"]["classes"].items()):
-            lines.append(f"  {cls}: {count} instances")
-    if summary["failed"]:
-        lines.append(f"\n⚠ Failures: {summary['failed']}")
-        for e in summary["errors"][:5]:
-            lines.append(f"  - {e}")
+    yield "\n".join(log_lines), None
 
-    log_text = "\n".join(lines)
-    coco_path = summary.get("coco_path", "")
-    return log_text, coco_path if coco_path else None
+    # Run batch in a background thread; communicate via queue
+    q: queue.Queue = queue.Queue()
+
+    def _run():
+        def prog_cb(current, total, msg):
+            q.put(("prog", current, total, msg))
+        try:
+            summary = batch.run(
+                input_path=folder_path,
+                active_classes=active_classes,
+                output_dir=out_dir,
+                save_viz=save_viz,
+                save_coco=True,
+                progress_callback=prog_cb,
+            )
+            q.put(("done", summary))
+        except Exception as e:
+            q.put(("error", str(e), traceback.format_exc()))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    while True:
+        item = q.get()
+        kind = item[0]
+
+        if kind == "prog":
+            _, current, total, msg = item
+            progress(current / total if total > 0 else 0, desc=msg)
+            log_lines[-1] = f"  {msg}"
+            yield "\n".join(log_lines), None
+
+        elif kind == "done":
+            summary = item[1]
+            loc = summary.get("output_location", "")
+            loc_warn = (
+                "\n⚠ USB not writable — saved LOCALLY"
+                "\n  Fix: sudo umount /mnt/usbssd && sudo mount -t exfat /dev/sda1 /mnt/usbssd"
+                " -o uid=1000,gid=1000,fmask=0133,dmask=0022,iocharset=utf8,errors=remount-ro"
+            ) if loc == "local_fallback" else ""
+
+            lines = [
+                f"✓ Batch complete!{loc_warn}",
+                f"  Processed: {summary['processed']}/{summary['total_images']} images"
+                + (f"  ({summary['skipped']} skipped/resumed)" if summary.get("skipped") else ""),
+                f"  Annotations: {summary['total_annotations']}",
+                f"  Output: {summary['output_dir']}",
+            ]
+            if summary.get("coco_summary", {}).get("classes"):
+                lines.append("\nClass breakdown:")
+                for cls, count in sorted(summary["coco_summary"]["classes"].items()):
+                    lines.append(f"  {cls}: {count} instances")
+            if summary["failed"]:
+                lines.append(f"\n⚠ Failures: {summary['failed']}")
+                for e in summary["errors"][:5]:
+                    lines.append(f"  - {e}")
+
+            coco_path = summary.get("coco_path") or None
+            yield "\n".join(lines), coco_path
+            break
+
+        elif kind == "error":
+            _, msg, tb = item
+            yield f"✗ Error:\n{msg}\n\n{tb}", None
+            break
 
 
 # ── Build the Gradio UI ───────────────────────────────────────────────────────
@@ -234,6 +301,9 @@ def build_app(config_path: str = None) -> gr.Blocks:
 
     default_classes: list[str] = _config.get("classes", [])
     default_output_dir = _config.get("output", {}).get("dir", "outputs")
+    default_conf = _config.get("pipeline", {}).get("confidence_threshold", 0.03)
+    default_sam = _config.get("pipeline", {}).get("sam_score_threshold", 0.0)
+    default_batch_size = _config.get("pipeline", {}).get("inference_batch_size", 8)
 
     with gr.Blocks(
         title="SAM3 Auto-Labeler",
@@ -322,13 +392,13 @@ Detect objects by class name → segment → export COCO JSON
             with gr.Row():
                 confidence = gr.Slider(
                     0.0, 1.0,
-                    value=_config.get("pipeline", {}).get("confidence_threshold", 0.03),
+                    value=default_conf,
                     step=0.01,
                     label="Min detection confidence  (start: 0.03 · lower → more recall · raise → fewer false positives)",
                 )
                 sam_score = gr.Slider(
                     0.0, 1.0,
-                    value=_config.get("pipeline", {}).get("sam_score_threshold", 0.0),
+                    value=default_sam,
                     step=0.05,
                     label="Min SAM mask quality score  (0.0 = keep all)",
                 )
@@ -387,6 +457,12 @@ Detect objects by class name → segment → export COCO JSON
                             label="Output directory (leave blank for <input_folder>/outputs/)",
                             placeholder="default: <input_folder>/outputs/",
                         )
+                    batch_size_slider = gr.Slider(
+                        1, 128,
+                        value=default_batch_size,
+                        step=1,
+                        label="Inference batch size  (lower if you get OOM / Killed errors)",
+                    )
                     batch_btn = gr.Button(
                         "Start Batch Processing", variant="primary", size="lg"
                     )
@@ -410,6 +486,7 @@ Detect objects by class name → segment → export COCO JSON
                     sam_score_2,
                     save_viz_check,
                     output_dir_input,
+                    batch_size_slider,
                 ],
                 outputs=[batch_log, coco_batch_download],
             )
@@ -468,8 +545,9 @@ Detect objects by class name → segment → export COCO JSON
 - Overlapping masks from different classes both show through
 
 ### Batch processing
-- Images are processed one at a time (GPU memory constraint)
+- Lower **Inference batch size** if the process gets killed (OOM). Try 8 or 4.
 - Failed images are skipped and logged in `summary.json`
+- Batch resumes automatically if re-run on the same folder
 
 ### Output format
 - COCO JSON is compatible with **CVAT**, **Label Studio**, **Roboflow**, and standard training pipelines
@@ -479,6 +557,30 @@ Detect objects by class name → segment → export COCO JSON
 ~6 GB VRAM (SAM3 CLIP+DETR detector + mask decoder)
 """
             )
+
+        # ── Restore saved state on page load ──────────────────────────────
+        def _restore_state():
+            state = _load_state()
+            return (
+                state.get("folder_path", ""),
+                state.get("output_dir", ""),
+                state.get("save_viz", True),
+                state.get("batch_size", default_batch_size),
+                state.get("confidence", default_conf),
+                state.get("sam_score", default_sam),
+            )
+
+        demo.load(
+            fn=_restore_state,
+            outputs=[
+                folder_input,
+                output_dir_input,
+                save_viz_check,
+                batch_size_slider,
+                confidence_2,
+                sam_score_2,
+            ],
+        )
 
     return demo
 
