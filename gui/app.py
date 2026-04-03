@@ -498,4 +498,5 @@ if __name__ == "__main__":
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        allowed_paths=["/mnt/usbssd", "/tmp"],
     )
