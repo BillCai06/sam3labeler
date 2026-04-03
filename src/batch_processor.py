@@ -362,9 +362,9 @@ class BatchProcessor:
         Smart entry point: auto-detects single-folder vs multi-folder layout.
 
         - If input contains sub-directories that have images, each sub-dir is
-          processed independently and output is written into each sub-dir
-          (output_dir override is ignored in multi-folder mode so results stay
-          next to their source data).
+          processed independently and output is written into each sub-dir.
+          output_dir is ignored in multi-folder mode so results stay next to
+          their source data.
         - Otherwise falls back to plain run() on the input as-is.
 
         Returns a list of summary dicts (one per folder processed).
@@ -381,24 +381,42 @@ class BatchProcessor:
             subdirs_with_images = []
 
         if subdirs_with_images:
-            print(f"\nMulti-folder mode: {len(subdirs_with_images)} sub-folders found")
-            for d in subdirs_with_images:
-                n = len(get_image_paths(str(d)))
+            # Precount for a unified cross-folder progress bar
+            subdir_counts = [(d, len(get_image_paths(str(d)))) for d in subdirs_with_images]
+            grand_total = sum(c for _, c in subdir_counts)
+
+            print(f"\nMulti-folder mode: {len(subdirs_with_images)} sub-folders, {grand_total} images total")
+            for d, n in subdir_counts:
                 print(f"  {d.name}/  ({n} images)")
             print()
 
             summaries = []
-            for i, subdir in enumerate(subdirs_with_images):
+            offset = 0
+            for i, (subdir, count) in enumerate(subdir_counts):
                 print(f"[{i + 1}/{len(subdirs_with_images)}] {subdir.name}")
+
+                # Wrap callback so progress is relative to grand total
+                if progress_callback is not None:
+                    _offset = offset  # capture for closure
+
+                    def _wrapped_cb(current, total, msg, _o=_offset):
+                        progress_callback(_o + current, grand_total, msg)
+
+                    cb = _wrapped_cb
+                else:
+                    cb = None
+
                 summary = self.run(
                     input_path=subdir,
                     active_classes=active_classes,
-                    output_dir=None,   # always write into each subdir
+                    output_dir=None,  # always write into each subdir
                     save_viz=save_viz,
                     save_coco=save_coco,
-                    progress_callback=progress_callback,
+                    progress_callback=cb,
                 )
                 summaries.append(summary)
+                offset += count
+
             return summaries
 
         # Single folder / single file — behave exactly as before

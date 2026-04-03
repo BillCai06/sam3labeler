@@ -229,7 +229,7 @@ def run_batch(
         def prog_cb(current, total, msg):
             q.put(("prog", current, total, msg))
         try:
-            summary = batch.run(
+            summaries = batch.run_auto(
                 input_path=folder_path,
                 active_classes=active_classes,
                 output_dir=out_dir,
@@ -237,7 +237,7 @@ def run_batch(
                 save_coco=True,
                 progress_callback=prog_cb,
             )
-            q.put(("done", summary))
+            q.put(("done", summaries))
         except Exception as e:
             q.put(("error", str(e), traceback.format_exc()))
 
@@ -254,31 +254,45 @@ def run_batch(
             yield "\n".join(log_lines), None
 
         elif kind == "done":
-            summary = item[1]
-            loc = summary.get("output_location", "")
+            summaries = item[1]
+            multi = len(summaries) > 1
+
+            total_proc = sum(s["processed"] for s in summaries)
+            total_imgs = sum(s["total_images"] for s in summaries)
+            total_ann  = sum(s["total_annotations"] for s in summaries)
+            total_fail = sum(s["failed"] for s in summaries)
+            any_fallback = any(s.get("output_location") == "local_fallback" for s in summaries)
+
             loc_warn = (
                 "\n⚠ USB not writable — saved LOCALLY"
                 "\n  Fix: sudo umount /mnt/usbssd && sudo mount -t exfat /dev/sda1 /mnt/usbssd"
                 " -o uid=1000,gid=1000,fmask=0133,dmask=0022,iocharset=utf8,errors=remount-ro"
-            ) if loc == "local_fallback" else ""
+            ) if any_fallback else ""
 
-            lines = [
-                f"✓ Batch complete!{loc_warn}",
-                f"  Processed: {summary['processed']}/{summary['total_images']} images"
-                + (f"  ({summary['skipped']} skipped/resumed)" if summary.get("skipped") else ""),
-                f"  Annotations: {summary['total_annotations']}",
-                f"  Output: {summary['output_dir']}",
+            lines = [f"✓ Batch complete!{loc_warn}"]
+            if multi:
+                lines.append(f"  {len(summaries)} sub-folders processed")
+            lines += [
+                f"  Processed: {total_proc}/{total_imgs} images",
+                f"  Annotations: {total_ann}",
             ]
-            if summary.get("coco_summary", {}).get("classes"):
-                lines.append("\nClass breakdown:")
-                for cls, count in sorted(summary["coco_summary"]["classes"].items()):
-                    lines.append(f"  {cls}: {count} instances")
-            if summary["failed"]:
-                lines.append(f"\n⚠ Failures: {summary['failed']}")
-                for e in summary["errors"][:5]:
-                    lines.append(f"  - {e}")
 
-            coco_path = summary.get("coco_path") or None
+            for s in summaries:
+                skipped_note = f" ({s['skipped']} skipped)" if s.get("skipped") else ""
+                lines.append(f"\n  [{Path(s['output_dir']).parent.name}]  {s['processed']}/{s['total_images']}{skipped_note} → {s['output_dir']}")
+                if s.get("coco_summary", {}).get("classes"):
+                    for cls, cnt in sorted(s["coco_summary"]["classes"].items()):
+                        lines.append(f"    {cls}: {cnt}")
+                if s["failed"]:
+                    lines.append(f"    ⚠ {s['failed']} failures")
+                    for e in s["errors"][:3]:
+                        lines.append(f"      - {e}")
+
+            if total_fail:
+                lines.append(f"\n⚠ Total failures: {total_fail}")
+
+            # Single folder → offer coco download; multi-folder → paths are in log
+            coco_path = summaries[0].get("coco_path") if not multi else None
             yield "\n".join(lines), coco_path
             break
 
