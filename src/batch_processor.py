@@ -17,6 +17,7 @@ Resume: if checkpoint.json exists in the output dir, already-processed images ar
 Delete checkpoint.json (or the whole output dir) to start fresh.
 """
 
+import gc
 import json
 import logging
 import traceback
@@ -120,15 +121,7 @@ class BatchProcessor:
             return summary
 
         viz_alpha = self.out_cfg.get("viz_alpha", 0.5)
-
-        # Load existing combined COCO if resuming
-        combined_writer = COCOWriter(active_classes) if save_coco else None
         combined_json = run_dir / "annotations.json"
-        if save_coco and combined_json.exists() and done_set:
-            try:
-                combined_writer.load(combined_json)
-            except Exception:
-                pass  # corrupt combined JSON — will be rebuilt from per-image files
 
         use_batched = isinstance(self.pipeline.detector, Sam3ImageDetector)
         batch_size = self.inference_batch_size if use_batched else 1
@@ -144,8 +137,7 @@ class BatchProcessor:
                     newly_done = self._run_image_batch(
                         batch_paths, active_classes,
                         run_dir, viz_dir, json_dir, viz_alpha,
-                        save_coco, save_viz,
-                        combined_writer, summary,
+                        save_coco, save_viz, summary,
                         progress_callback, skipped + processed_count, len(image_paths),
                         input_dir,
                     )
@@ -153,8 +145,7 @@ class BatchProcessor:
                     newly_done = self._run_single(
                         batch_paths[0], active_classes,
                         run_dir, viz_dir, json_dir, viz_alpha,
-                        save_coco, save_viz,
-                        combined_writer, summary,
+                        save_coco, save_viz, summary,
                         progress_callback, skipped + processed_count, len(image_paths),
                         input_dir,
                     )
@@ -164,12 +155,13 @@ class BatchProcessor:
 
                 processed_count += len(batch_paths)
                 pbar.update(len(batch_paths))
+                gc.collect()
 
         # ── Finalise ──────────────────────────────────────────────────
         if save_coco:
-            combined_writer.save(combined_json)
+            coco_summary = self._merge_per_image_jsons(json_dir, combined_json, active_classes)
             summary["coco_path"] = str(combined_json)
-            summary["coco_summary"] = combined_writer.summary()
+            summary["coco_summary"] = coco_summary
 
         summary_path = run_dir / "summary.json"
         with open(summary_path, "w") as f:
@@ -236,7 +228,7 @@ class BatchProcessor:
     def _run_image_batch(
         self, paths, active_classes,
         run_dir, viz_dir, json_dir, viz_alpha,
-        save_coco, save_viz, combined_writer, summary,
+        save_coco, save_viz, summary,
         progress_callback, processed_so_far, total,
         input_dir=None,
     ) -> list[str]:
@@ -276,12 +268,15 @@ class BatchProcessor:
         from .utils import apply_nms
         newly_done = []
 
-        for img_path, image, raw_results in zip(loaded_paths, images, batch_results):
+        # Index-based loop so we can null out each slot immediately after use,
+        # freeing mask numpy arrays and PIL images one by one instead of all at once.
+        for idx in range(len(loaded_paths)):
+            img_path = loaded_paths[idx]
+            image = images[idx]
             rel_key = str(img_path.relative_to(input_dir)) if input_dir else img_path.name
-            # Flatten subdirectory into stem for output filenames: drone_frames/0001.jpg → drone_frames_0001
             flat_stem = rel_key.replace("/", "_").replace("\\", "_").rsplit(".", 1)[0]
             try:
-                results = apply_nms(raw_results, self.pipeline.nms_iou_threshold)
+                results = apply_nms(batch_results[idx], self.pipeline.nms_iou_threshold)
                 if self.pipeline.sam_score_threshold > 0:
                     results = [r for r in results if r["sam_score"] >= self.pipeline.sam_score_threshold]
 
@@ -291,7 +286,6 @@ class BatchProcessor:
                     per_writer = COCOWriter(active_classes)
                     per_writer.add_image_results(rel_key, results, img_w, img_h)
                     per_writer.save(json_dir / f"{flat_stem}.json")
-                    combined_writer.add_image_results(rel_key, results, img_w, img_h)
 
                 if save_viz and results:
                     viz_img = visualize_results(image, results, active_classes, alpha=viz_alpha)
@@ -305,6 +299,10 @@ class BatchProcessor:
                 logger.error(f"Failed saving {rel_key}: {traceback.format_exc()}")
                 summary["failed"] += 1
                 summary["errors"].append(f"{rel_key}: {e}")
+            finally:
+                # Release mask arrays and PIL image immediately — don't wait for loop end
+                batch_results[idx] = None
+                images[idx] = None
 
         return newly_done
 
@@ -315,7 +313,7 @@ class BatchProcessor:
     def _run_single(
         self, img_path, active_classes,
         run_dir, viz_dir, json_dir, viz_alpha,
-        save_coco, save_viz, combined_writer, summary,
+        save_coco, save_viz, summary,
         progress_callback, processed_so_far, total,
         input_dir=None,
     ) -> list[str]:
@@ -331,7 +329,6 @@ class BatchProcessor:
                 per_writer = COCOWriter(active_classes)
                 per_writer.add_image_results(rel_key, results, img_w, img_h)
                 per_writer.save(json_dir / f"{flat_stem}.json")
-                combined_writer.add_image_results(rel_key, results, img_w, img_h)
 
             if save_viz and results:
                 viz_img = visualize_results(image, results, active_classes, alpha=viz_alpha)
@@ -421,6 +418,43 @@ class BatchProcessor:
 
         # Single folder / single file — behave exactly as before
         return [self.run(input_path, active_classes, output_dir, save_viz, save_coco, progress_callback)]
+
+    # ------------------------------------------------------------------
+    # Merge per-image JSONs into one combined annotations.json
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_per_image_jsons(json_dir: Path, combined_path: Path, active_classes: list[str]) -> dict:
+        """
+        Reads all per-image JSON files from json_dir and writes a single
+        merged annotations.json.  Done at the end of a run so the combined
+        writer never accumulates in RAM during processing.
+        Strips any legacy 'bbox' fields in the process.
+        """
+        writer = COCOWriter(active_classes)
+        for json_file in sorted(json_dir.glob("*.json")):
+            try:
+                with open(json_file) as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.warning(f"Skipping corrupt JSON {json_file.name}: {e}")
+                continue
+            for img_info in data.get("images", []):
+                new_img_id = writer.add_image(
+                    img_info["file_name"], img_info["width"], img_info["height"]
+                )
+                old_img_id = img_info["id"]
+                for ann in data.get("annotations", []):
+                    if ann["image_id"] != old_img_id:
+                        continue
+                    writer._annotations.append({
+                        **{k: v for k, v in ann.items() if k not in ("id", "image_id", "bbox")},
+                        "id": writer._ann_id,
+                        "image_id": new_img_id,
+                    })
+                    writer._ann_id += 1
+        writer.save(combined_path)
+        return writer.summary()
 
     # ------------------------------------------------------------------
 

@@ -72,6 +72,10 @@ def main():
         "--port", type=int, default=None,
         help="Port for GUI or API server",
     )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help="Auto mode: read classes from config (no --classes needed), process sub-folders independently",
+    )
 
     args = parser.parse_args()
 
@@ -96,17 +100,22 @@ def main():
         uvicorn.run("api.main:app", host=host, port=port, reload=False)
         return
 
-    # CLI batch mode — require input and classes
+    # CLI batch mode
     if not args.input:
         parser.error("--input/-i is required for CLI batch mode")
-    if not args.classes:
-        parser.error("--classes/-c is required for CLI batch mode")
 
     from src.utils import load_config
     from src.pipeline import Pipeline
     from src.batch_processor import BatchProcessor
 
     config = load_config(args.config)
+
+    if args.auto and not args.classes:
+        args.classes = config.get("classes", [])
+        if not args.classes:
+            parser.error("--auto: no classes in config and --classes not specified")
+    elif not args.classes:
+        parser.error("--classes/-c is required (or use --auto to read from config)")
 
     # Override thresholds if provided
     if args.confidence is not None:

@@ -4,7 +4,7 @@ api:
 classes:
 - trail
 - grass
-- tree
+- trees
 - branch
 - underbrush
 - mulch
@@ -45,7 +45,7 @@ output:
   save_visualization: true
   viz_alpha: 0.5
 pipeline:
-  confidence_threshold: 0.03
-  inference_batch_size: 64
+  confidence_threshold: 0.35
+  inference_batch_size: 16
   nms_iou_threshold: 0.5
-  sam_score_threshold: 0.0
+  sam_score_threshold: 0.35

@@ -1,8 +1,8 @@
 {
-  "folder_path": "/mnt/usbssd/husky_drone_dataset/sensor_record_20260318_145250_dataset/",
+  "folder_path": "/mnt/usbssd/husky_drone_dataset/sensor_record_20260318_150450_dataset/",
   "output_dir": "",
   "save_viz": true,
-  "batch_size": 64,
+  "batch_size": 32,
   "confidence": 0.35,
   "sam_score": 0.35
 }

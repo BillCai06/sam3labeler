@@ -82,23 +82,21 @@ class COCOWriter:
 
         img_w, img_h = img["width"], img["height"]
 
-        # COCO bbox: [x, y, w, h] in pixels
-        coco_bbox = bbox_norm_to_coco(bbox_norm, img_w, img_h)
-
         # Segmentation as polygons
         if mask is not None:
             segmentation = mask_to_polygon(mask)
-            area = mask_area(mask)
+            area = float(mask_area(mask))
         else:
-            # Fall back to bbox polygon if no mask
-            x, y, w, h = coco_bbox
-            segmentation = [[x, y, x + w, y, x + w, y + h, x, y + h]]
-            area = w * h
+            segmentation = []
+            area = 0.0
 
         if not segmentation:
+            # Fallback: derive a polygon from the normalized bbox
             logger.debug(f"Empty polygon for {class_name}, using bbox fallback")
+            coco_bbox = bbox_norm_to_coco(bbox_norm, img_w, img_h)
             x, y, w, h = coco_bbox
             segmentation = [[x, y, x + w, y, x + w, y + h, x, y + h]]
+            area = float(w * h)
 
         ann_id = self._ann_id
         self._annotations.append({
@@ -106,10 +104,8 @@ class COCOWriter:
             "image_id": image_id,
             "category_id": cat_id,
             "segmentation": segmentation,
-            "bbox": [round(v, 2) for v in coco_bbox],
-            "area": float(area),
+            "area": area,
             "iscrowd": 0,
-            # Extra metadata (non-standard but useful)
             "attributes": {
                 "detection_confidence": round(confidence, 4),
                 "sam_score": round(sam_score, 4),
