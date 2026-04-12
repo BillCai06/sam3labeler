@@ -116,10 +116,34 @@ body{
 .cbtn:hover{border-color:rgba(255,255,255,.6)}
 .cbtn.act{border-color:#fff;box-shadow:0 0 0 2px rgba(255,255,255,.25)}
 
+/* Mode toggle */
+.mode-toggle{display:flex;gap:4px;margin-bottom:6px}
+.mbtn{
+  flex:1;padding:5px 4px;border:2px solid #48484a;border-radius:6px;
+  background:transparent;color:#8e8e93;cursor:pointer;
+  font:inherit;font-size:11px;font-weight:700;transition:all .1s;
+}
+.mbtn:hover{border-color:#8e8e93;color:#e5e5ea}
+.mbtn.on{border-color:#0a84ff;background:#1a3a5a;color:#64d2ff}
+
+/* Run SAM button */
+#run-sam-btn{
+  width:100%;padding:7px 0;border:none;border-radius:6px;
+  background:#5e35b1;color:#fff;cursor:pointer;
+  font:inherit;font-size:12px;font-weight:700;letter-spacing:.3px;
+  transition:background .1s;
+}
+#run-sam-btn:hover:not(:disabled){background:#7c4dda}
+#run-sam-btn:disabled{background:#3a3a3c;color:#636366;cursor:default}
+
 /* SAM slider */
 #sam-row{display:flex;align-items:center;gap:7px;margin-top:4px}
 #sam-slider{flex:1;accent-color:#0a84ff;cursor:pointer}
 #sam-val{font-size:12px;font-weight:700;min-width:32px;text-align:right;color:#0a84ff}
+/* Radius slider (point mode) */
+#rad-row{display:flex;align-items:center;gap:7px;margin-top:4px}
+#rad-slider{flex:1;accent-color:#ff9f0a;cursor:pointer}
+#rad-val{font-size:12px;font-weight:700;min-width:36px;text-align:right;color:#ff9f0a}
 
 /* Shortcuts */
 .keys{font-size:10px;color:#636366;line-height:1.8}
@@ -178,17 +202,42 @@ body{
       <button id="del-btn">Delete  <kbd>Del</kbd></button>
     </div>
 
+    <!-- Mode toggle -->
+    <div class="sec">
+      <div class="slbl">Mode</div>
+      <div class="mode-toggle">
+        <button class="mbtn on" id="mode-draw" title="Drag to draw bbox, then click class or press S">✏ Draw</button>
+        <button class="mbtn"    id="mode-point" title="Click on object center — SAM auto-segments">● Point</button>
+      </div>
+      <!-- Point mode: radius control -->
+      <div id="rad-sec" style="display:none">
+        <div style="font-size:10px;color:#636366;margin-bottom:2px">Click radius (scroll)</div>
+        <div id="rad-row">
+          <input type="range" id="rad-slider" min="0.03" max="0.35" step="0.01" value="0.12">
+          <span id="rad-val">12%</span>
+        </div>
+      </div>
+    </div>
+
     <!-- Class panel -->
     <div class="sec">
-      <div class="slbl">Classes</div>
+      <div class="slbl">Classes — click to assign / remap</div>
       <div id="cpan"></div>
+    </div>
+
+    <!-- Run SAM button -->
+    <div class="sec">
+      <button id="run-sam-btn" disabled>▶ Run SAM &nbsp;<kbd style="background:#3a2a6a;color:#c0a0ff;border-radius:3px;padding:0 4px;font-size:9px">S</kbd></button>
+      <div id="run-sam-hint" style="font-size:10px;color:#636366;margin-top:5px;text-align:center">
+        Draw bbox first, then click ▶
+      </div>
     </div>
 
     <!-- SAM threshold -->
     <div class="sec">
-      <div class="slbl">SAM Threshold</div>
+      <div class="slbl">SAM Threshold (scroll in draw mode)</div>
       <div id="sam-row">
-        <input type="range" id="sam-slider" min="0.10" max="0.90" step="0.05" value="0.40">
+        <input type="range" id="sam-slider" min="0.01" max="0.90" step="0.01" value="0.40">
         <span id="sam-val">0.40</span>
       </div>
     </div>
@@ -197,14 +246,17 @@ body{
     <div class="sec">
       <div class="slbl">Shortcuts</div>
       <div class="keys">
+        <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo<br>
+        <kbd>Space</kbd> toggle overlay<br>
         <kbd>A</kbd>/<kbd>←</kbd> prev image<br>
         <kbd>D</kbd>/<kbd>→</kbd> next image<br>
         <kbd>Del</kbd> delete selected<br>
-        <kbd>S</kbd> SAM on drawn bbox<br>
+        <kbd>S</kbd> SAM on bbox<br>
         <kbd>F</kbd> fit to canvas<br>
         <kbd>Esc</kbd> cancel / deselect<br>
         <kbd>Shift</kbd>+click multi-select<br>
-        <kbd>Scroll</kbd> SAM threshold<br>
+        Draw: <kbd>Scroll</kbd> SAM thresh<br>
+        Point: <kbd>Scroll</kbd> radius<br>
         <kbd>Ctrl</kbd>+<kbd>Scroll</kbd> zoom<br>
         <kbd>Mid</kbd>-drag pan
       </div>
@@ -260,6 +312,18 @@ const S = {
   // SAM
   samThresh: 0.40,
 
+  // Mode: 'draw' | 'point'
+  mode: 'draw',
+  pointRadius: 0.12,   // fraction of min(imgW,imgH) used as bbox half-size
+  mouseImg: null,      // {x,y} image coords — for point radius circle
+
+  // Overlay toggle (Space)
+  showLabels: true,
+
+  // Undo history (snapshots of S.anns)
+  history: [],
+  historyMax: 50,
+
   // State flags
   dirty: false,
   midDown: false,
@@ -297,12 +361,33 @@ function render() {
   // Image
   ctx.drawImage(S.imgEl, 0, 0);
 
-  // Annotations
-  for (const ann of S.anns) {
-    const cat = S.cats.find(c => c.id === ann.category_id);
-    const cls = cat ? cat.name : 'other';
-    const ci  = S.classes.find(c => c.name === cls) || {rgb:'128,128,128'};
-    drawAnn(ctx, ann, ci.rgb, S.selected.has(ann.id), S.hovId === ann.id);
+  // Annotations (hidden when Space-toggled off)
+  if (S.showLabels) {
+    for (const ann of S.anns) {
+      const cat = S.cats.find(c => c.id === ann.category_id);
+      const cls = cat ? cat.name : 'other';
+      const ci  = S.classes.find(c => c.name === cls) || {rgb:'128,128,128'};
+      drawAnn(ctx, ann, ci.rgb, S.selected.has(ann.id), S.hovId === ann.id);
+    }
+  }
+
+  // Point mode: radius circle at mouse position
+  if (S.mode === 'point' && S.mouseImg && S.imgW) {
+    const r = S.pointRadius * Math.min(S.imgW, S.imgH);
+    ctx.beginPath();
+    ctx.arc(S.mouseImg.x, S.mouseImg.y, r, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,204,0,0.85)';
+    ctx.lineWidth   = 2 / S.zoom;
+    ctx.setLineDash([6/S.zoom, 3/S.zoom]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(255,204,0,0.10)';
+    ctx.fill();
+    // Center dot
+    ctx.beginPath();
+    ctx.arc(S.mouseImg.x, S.mouseImg.y, 3/S.zoom, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,204,0,0.9)';
+    ctx.fill();
   }
 
   // In-progress draw (yellow dashed)
@@ -420,10 +505,8 @@ cv.addEventListener('mousedown', e => {
   }
 
   if (e.button === 0) {
-    if (S.pendingBbox) {
-      // Click on canvas while pending bbox → cancel if not clicking a class
-      return;
-    }
+    if (S.mode === 'point') return;  // handled on mouseup (click, not drag)
+    if (S.pendingBbox) return;       // waiting for class assignment
     S.isDrawing  = true;
     S.drawStart  = {x:ix, y:iy};
     S.drawCur    = {x:ix, y:iy};
@@ -444,6 +527,10 @@ cv.addEventListener('mousemove', e => {
     S.drawCur = {x:ix, y:iy};
     schedRender(); return;
   }
+
+  // Always track mouse image coords for point mode circle
+  S.mouseImg = {x:ix, y:iy};
+  if (S.mode === 'point') { schedRender(); }
 
   // Hover
   const hit = hitTest(ix, iy);
@@ -473,6 +560,24 @@ cv.addEventListener('mouseup', e => {
     return;
   }
 
+  // Point mode: click → run SAM at that point
+  if (e.button === 0 && S.mode === 'point') {
+    const hit = hitTest(ix, iy);
+    if (hit !== null) {
+      // Clicked an existing annotation → select it
+      if (e.shiftKey) {
+        S.selected.has(hit) ? S.selected.delete(hit) : S.selected.add(hit);
+      } else {
+        S.selected.clear(); S.selected.add(hit);
+      }
+      updateSelUI(); schedRender();
+    } else {
+      // Empty area → run point segmentation
+      doSamPoint(ix, iy);
+    }
+    return;
+  }
+
   if (e.button === 0 && S.isDrawing) {
     S.isDrawing = false;
     const dx = Math.abs((S.drawCur?.x??0)-(S.drawStart?.x??0));
@@ -489,6 +594,7 @@ cv.addEventListener('mouseup', e => {
       S.selected.clear();
       S.drawStart = S.drawCur = null;
       showPendingHint(true);
+      updateRunSamBtn();
       updateSelUI();
     } else {
       // Short drag → selection click
@@ -513,7 +619,7 @@ cv.addEventListener('mouseup', e => {
 });
 
 cv.addEventListener('mouseleave', () => {
-  S.hovId = null;
+  S.hovId = null; S.mouseImg = null;
   document.getElementById('ttip').style.display = 'none';
   schedRender();
 });
@@ -523,12 +629,20 @@ cv.addEventListener('wheel', e => {
   const {x:cx,y:cy} = cvCoords(e);
   if (e.ctrlKey || e.metaKey) {
     zoomAt(cx, cy, e.deltaY < 0 ? 1.12 : 1/1.12);
+  } else if (S.mode === 'point') {
+    // Scroll in point mode → adjust radius
+    const d = e.deltaY > 0 ? -0.01 : 0.01;
+    S.pointRadius = Math.round(Math.min(0.35, Math.max(0.03, S.pointRadius+d))*100)/100;
+    document.getElementById('rad-slider').value = S.pointRadius;
+    document.getElementById('rad-val').textContent = Math.round(S.pointRadius*100) + '%';
+    updateHud();
   } else {
-    const d = e.deltaY > 0 ? -0.05 : 0.05;
-    S.samThresh = Math.round(Math.min(0.9, Math.max(0.1, S.samThresh+d))*100)/100;
+    // Draw mode → adjust SAM threshold
+    const d = e.deltaY > 0 ? -0.01 : 0.01;
+    S.samThresh = Math.round(Math.min(0.9, Math.max(0.01, S.samThresh+d))*100)/100;
     document.getElementById('sam-slider').value = S.samThresh;
-    document.getElementById('sam-val').textContent  = S.samThresh.toFixed(2);
-    document.getElementById('hud').textContent = `SAM: ${S.samThresh.toFixed(2)}`;
+    document.getElementById('sam-val').textContent = S.samThresh.toFixed(2);
+    updateHud();
   }
   schedRender();
 }, {passive:false});
@@ -539,6 +653,15 @@ cv.addEventListener('wheel', e => {
 document.addEventListener('keydown', async e => {
   if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
 
+  if ((e.key==='z'||e.key==='Z') && (e.ctrlKey||e.metaKey)) {
+    e.preventDefault(); undoLast(); return;
+  }
+  if (e.key===' ') {
+    e.preventDefault();
+    S.showLabels = !S.showLabels;
+    document.getElementById('hud').style.opacity = S.showLabels ? '1' : '0.4';
+    schedRender(); return;
+  }
   if (e.key==='ArrowRight' || (e.key==='d' && !e.ctrlKey && !e.metaKey)) {
     e.preventDefault(); await navigate(+1);
   } else if (e.key==='ArrowLeft' || (e.key==='a' && !e.ctrlKey && !e.metaKey)) {
@@ -554,15 +677,31 @@ document.addEventListener('keydown', async e => {
     S.pendingBbox=null; S.isDrawing=false;
     S.drawStart=S.drawCur=null;
     S.selected.clear();
-    showPendingHint(false); updateSelUI(); schedRender();
+    showPendingHint(false); updateRunSamBtn(); updateSelUI(); schedRender();
   }
 });
 
 // ═══════════════════════════════════════════════════════════
 // ANNOTATION OPERATIONS
 // ═══════════════════════════════════════════════════════════
+// ── Undo ──────────────────────────────────────
+function pushHistory() {
+  S.history.push(JSON.parse(JSON.stringify(S.anns)));
+  if (S.history.length > S.historyMax) S.history.shift();
+}
+
+function undoLast() {
+  if (!S.history.length) { flash('Nothing to undo'); return; }
+  S.anns     = S.history.pop();
+  S.selected.clear();
+  S.dirty    = true;
+  updateSelUI(); updateAnnCt(); schedRender();
+  flash(`Undo (${S.history.length} left)`);
+}
+
 function deleteSelected() {
   if (!S.selected.size) return;
+  pushHistory();
   S.anns  = S.anns.filter(a => !S.selected.has(a.id));
   S.selected.clear();
   S.dirty = true;
@@ -573,6 +712,7 @@ function assignClass(className) {
   const cat = getOrMakeCat(className);
 
   if (S.pendingBbox) {
+    pushHistory();
     const {x1,y1,x2,y2} = S.pendingBbox;
     const nid = nextAnnId();
     S.anns.push({
@@ -588,10 +728,12 @@ function assignClass(className) {
     S.pendingBbox = null;
     S.dirty = true;
     showPendingHint(false);
+    updateRunSamBtn();
     updateSelUI(); updateAnnCt(); schedRender();
     flash(`Added: ${className}`);
 
   } else if (S.selected.size > 0) {
+    pushHistory();
     for (const ann of S.anns) {
       if (S.selected.has(ann.id)) ann.category_id = cat.id;
     }
@@ -616,9 +758,7 @@ async function doSam() {
   const imgPath = S.images[S.idx]?.imagePath;
   if (!imgPath) { flash('No image path for SAM'); return; }
 
-  // Use activeClass (last clicked class button)
   const className = S.activeClass ?? S.classes[0]?.name ?? 'other';
-
   const {x1,y1,x2,y2} = S.pendingBbox;
   const bboxNorm = [x1/S.imgW, y1/S.imgH, x2/S.imgW, y2/S.imgH];
 
@@ -626,42 +766,76 @@ async function doSam() {
   try {
     const r = await fetch('/api/sam', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        image_path: imgPath,
-        class_name: className,
-        bbox: bboxNorm,
-        sam_threshold: S.samThresh,
-      }),
+      body: JSON.stringify({image_path:imgPath, class_name:className,
+                            bbox:bboxNorm, sam_threshold:S.samThresh}),
     });
     const data = await r.json();
     if (!data.found) { flash(`SAM: ${data.message||'not found'}`); return; }
 
-    const cat = getOrMakeCat(className);
-    const nid = nextAnnId();
-    S.anns.push({
-      id: nid,
-      image_id: S.imgInfo.id ?? 1,
-      category_id: cat.id,
-      segmentation: data.segmentation,
-      area: data.area,
-      iscrowd: 0,
-      attributes: {
-        detection_confidence: data.confidence,
-        sam_score: data.sam_score,
-        manual: true,
-      },
-    });
-    S.selected = new Set([nid]);
-    S.pendingBbox = null;
-    S.dirty = true;
-    showPendingHint(false);
-    updateSelUI(); updateAnnCt(); schedRender();
-    flash(`SAM: ${className} (${data.confidence.toFixed(2)})`);
+    // If fallback fired and a different class was detected, use it
+    const usedClass = data.detected_class || className;
+    _commitSamResult(data, usedClass);
+    flash(`SAM: ${usedClass} (${data.confidence.toFixed(2)})`);
   } catch(err) {
     flash(`SAM error: ${err.message}`);
   } finally {
     document.getElementById('sam-spin').style.display = 'none';
   }
+}
+
+async function doSamPoint(ix, iy) {
+  const imgPath = S.images[S.idx]?.imagePath;
+  if (!imgPath || !S.imgW || !S.imgH) { flash('No image loaded'); return; }
+
+  document.getElementById('sam-spin').style.display = 'flex';
+  try {
+    const r = await fetch('/api/sam_point', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        image_path: imgPath,
+        x_norm: ix / S.imgW,
+        y_norm: iy / S.imgH,
+        radius_norm: S.pointRadius,
+        class_name: S.activeClass ?? '',   // empty = try all classes
+        sam_threshold: S.samThresh,
+      }),
+    });
+    const data = await r.json();
+    if (!data.found) { flash(`SAM point: ${data.message||'not found'}`); return; }
+
+    const detClass = data.detected_class || S.activeClass || S.classes[0]?.name || 'other';
+    _commitSamResult(data, detClass);
+    flash(`SAM point: ${detClass} (${data.confidence.toFixed(2)})`);
+  } catch(err) {
+    flash(`SAM point error: ${err.message}`);
+  } finally {
+    document.getElementById('sam-spin').style.display = 'none';
+  }
+}
+
+function _commitSamResult(data, className) {
+  pushHistory();
+  const cat = getOrMakeCat(className);
+  const nid = nextAnnId();
+  S.anns.push({
+    id: nid,
+    image_id: S.imgInfo.id ?? 1,
+    category_id: cat.id,
+    segmentation: data.segmentation,
+    area: data.area,
+    iscrowd: 0,
+    attributes: {
+      detection_confidence: data.confidence,
+      sam_score: data.sam_score,
+      manual: true,
+    },
+  });
+  S.selected = new Set([nid]);
+  S.pendingBbox = null;
+  S.dirty = true;
+  showPendingHint(false);
+  updateRunSamBtn();
+  updateSelUI(); updateAnnCt(); schedRender();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -679,7 +853,7 @@ async function loadImg(idx) {
   S.idx = idx;
   S.selected.clear(); S.pendingBbox=null;
   S.isDrawing=false; S.drawStart=S.drawCur=null;
-  S.dirty=false; S.hovId=null;
+  S.dirty=false; S.hovId=null; S.history=[];
   showPendingHint(false);
 
   const item = S.images[idx];
@@ -813,6 +987,25 @@ function flash(msg, dur=2500) {
   }, dur);
 }
 
+function updateHud() {
+  const hud = document.getElementById('hud');
+  if (S.mode === 'point') {
+    hud.textContent = `POINT | r: ${Math.round(S.pointRadius*100)}%  SAM: ${S.samThresh.toFixed(2)}`;
+  } else {
+    hud.textContent = `DRAW | SAM: ${S.samThresh.toFixed(2)}`;
+  }
+}
+
+function updateRunSamBtn() {
+  const btn  = document.getElementById('run-sam-btn');
+  const hint = document.getElementById('run-sam-hint');
+  const hasBbox = !!S.pendingBbox && S.mode === 'draw';
+  btn.disabled = !hasBbox;
+  hint.textContent = hasBbox
+    ? `Class: ${S.activeClass ?? '(click a class first)'}  →  ▶`
+    : S.mode === 'point' ? 'Click on object to segment' : 'Draw bbox first, then click ▶';
+}
+
 // ═══════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════
@@ -906,6 +1099,24 @@ async function initClasses() {
 function buildClassPanel() {
   const panel = document.getElementById('cpan');
   panel.innerHTML = '';
+
+  // "Auto" button: clears active class so SAM tries all classes
+  const auto = document.createElement('button');
+  auto.className   = 'cbtn';
+  auto.textContent = '🔍 Auto';
+  auto.title       = 'No class — SAM tries all classes + generic probes';
+  auto.dataset.cls = '';
+  auto.style.background = '#3a3a3c';
+  auto.style.color = '#e5e5ea';
+  auto.style.borderColor = '#636366';
+  auto.addEventListener('click', () => {
+    S.activeClass = null;
+    document.querySelectorAll('.cbtn').forEach(b => b.classList.remove('act'));
+    auto.classList.add('act');
+    flash('Auto mode — SAM will detect class automatically');
+  });
+  panel.appendChild(auto);
+
   for (const cls of S.classes) {
     const btn = document.createElement('button');
     btn.className    = 'cbtn';
@@ -931,10 +1142,34 @@ document.getElementById('ds-sel').addEventListener('change', function(){
 
 document.getElementById('del-btn').addEventListener('click', deleteSelected);
 
+document.getElementById('run-sam-btn').addEventListener('click', doSam);
+
+document.getElementById('mode-draw').addEventListener('click', () => setMode('draw'));
+document.getElementById('mode-point').addEventListener('click', () => setMode('point'));
+
+function setMode(m) {
+  S.mode = m;
+  document.getElementById('mode-draw').classList.toggle('on', m === 'draw');
+  document.getElementById('mode-point').classList.toggle('on', m === 'point');
+  document.getElementById('rad-sec').style.display  = m === 'point' ? 'block' : 'none';
+  // Cancel any pending state when switching
+  S.pendingBbox = null; S.isDrawing = false; S.drawStart = S.drawCur = null;
+  showPendingHint(false);
+  updateRunSamBtn();
+  updateHud();
+  schedRender();
+}
+
 document.getElementById('sam-slider').addEventListener('input', function(){
   S.samThresh = parseFloat(this.value);
-  document.getElementById('sam-val').textContent   = S.samThresh.toFixed(2);
-  document.getElementById('hud').textContent = `SAM: ${S.samThresh.toFixed(2)}`;
+  document.getElementById('sam-val').textContent = S.samThresh.toFixed(2);
+  updateHud();
+});
+
+document.getElementById('rad-slider').addEventListener('input', function(){
+  S.pointRadius = parseFloat(this.value);
+  document.getElementById('rad-val').textContent = Math.round(S.pointRadius*100) + '%';
+  updateHud();
 });
 
 // Resize handler
@@ -950,6 +1185,8 @@ window.addEventListener('beforeunload', e=>{
 // ═══════════════════════════════════════════════════════════
 (async function(){
   await Promise.all([initDatasets(), initClasses()]);
+  updateHud();
+  updateRunSamBtn();
   schedRender();
 })();
 </script>

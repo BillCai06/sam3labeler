@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 # Set by run_batch.py via env var before uvicorn import
 _CONFIG_PATH = os.environ.get("LABELER_CONFIG", "config.yaml")
 
+# Generic probe classes used when no text class is specified (class-free mode)
+_GENERIC_PROBES = [
+    "object", "thing", "item", "structure",
+    "vehicle", "machine", "equipment", "device", "robot",
+    "animal", "person", "plant", "debris",
+]
+
 # Lazy-loaded SAM detector (first /api/sam call loads it)
 _sam_detector = None
 
@@ -204,8 +211,139 @@ class SamBody(BaseModel):
 
 @app.post("/api/sam")
 async def api_sam(body: SamBody):
-    global _sam_detector
+    det = await _ensure_sam()
 
+    try:
+        from PIL import Image as PILImage
+
+        img_orig = PILImage.open(body.image_path).convert("RGB")
+        W, H = img_orig.size
+
+        # Crop to user's drawn bbox (+ 20% padding), then cap resolution
+        crop, ox, oy = _crop_region(img_orig, body.bbox, padding=0.20)
+        crop_sm, sx, sy = _downsample_for_sam(crop)
+        logger.debug("SAM bbox: orig=%dx%d  crop=%dx%d  sam_in=%dx%d",
+                     W, H, crop.width, crop.height, crop_sm.width, crop_sm.height)
+
+        # Try specific class first; fall back to all classes + generic probes
+        dets = det.detect_and_segment(
+            image=crop_sm, classes=[body.class_name],
+            confidence_threshold=body.sam_threshold,
+        )
+        if not dets:
+            all_cls = _all_classes()
+            for g in _GENERIC_PROBES:
+                if g not in all_cls:
+                    all_cls.append(g)
+            if all_cls:
+                dets = det.detect_and_segment(
+                    image=crop_sm, classes=all_cls,
+                    confidence_threshold=body.sam_threshold,
+                )
+        if not dets:
+            return {"found": False, "message": "No detections found (tried all classes)"}
+
+        # Highest confidence (crop is already the region of interest — no IoU needed)
+        best = max(dets, key=lambda d: d["confidence"])
+        polys, area = _extract_polys(best, crop_sm, ox, oy, sx, sy)
+
+        return {
+            "found": True,
+            "segmentation": polys,
+            "area": area,
+            "confidence": float(best["confidence"]),
+            "sam_score": float(best.get("sam_score", 0.0)),
+            "detected_class": best["class"],
+        }
+    except Exception as e:
+        logger.exception("SAM bbox inference failed")
+        raise HTTPException(500, detail=str(e))
+
+
+# ──────────────────────────────────────────────
+# /api/sam_point  — click-center pure segmentation
+# ──────────────────────────────────────────────
+
+class SamPointBody(BaseModel):
+    image_path: str
+    x_norm: float              # normalized click x (0-1)
+    y_norm: float              # normalized click y (0-1)
+    radius_norm: float = 0.12  # half-size of synthetic bbox (fraction of min dim)
+    class_name: str = ""       # empty = try all classes
+    sam_threshold: float = 0.40
+
+
+@app.post("/api/sam_point")
+async def api_sam_point(body: SamPointBody):
+    det = await _ensure_sam()
+
+    try:
+        from PIL import Image as PILImage
+
+        img_orig = PILImage.open(body.image_path).convert("RGB")
+        W, H = img_orig.size
+
+        # Crop to the radius circle's bounding box, then cap resolution
+        r = body.radius_norm
+        bbox_n = [
+            max(0.0, body.x_norm - r), max(0.0, body.y_norm - r),
+            min(1.0, body.x_norm + r), min(1.0, body.y_norm + r),
+        ]
+        crop, ox, oy = _crop_region(img_orig, bbox_n, padding=0.10)
+        crop_sm, sx, sy = _downsample_for_sam(crop)
+        logger.debug("SAM point: orig=%dx%d  crop=%dx%d  sam_in=%dx%d",
+                     W, H, crop.width, crop.height, crop_sm.width, crop_sm.height)
+
+        # Which classes to query
+        if body.class_name:
+            classes = [body.class_name]
+        else:
+            classes = _all_classes()
+            for g in _GENERIC_PROBES:
+                if g not in classes:
+                    classes.append(g)
+
+        dets = det.detect_and_segment(
+            image=crop_sm, classes=classes,
+            confidence_threshold=body.sam_threshold,
+        )
+        if not dets:
+            return {"found": False, "message": "No detections found"}
+
+        # Click point in crop_sm space: subtract crop offset, divide by scale
+        xp = max(0, min(crop_sm.width  - 1, int((body.x_norm * W - ox) / sx)))
+        yp = max(0, min(crop_sm.height - 1, int((body.y_norm * H - oy) / sy)))
+
+        mask_hits = [d for d in dets if d.get("mask") is not None and d["mask"][yp, xp]]
+        if mask_hits:
+            # Most specific mask covering the click point
+            best = min(mask_hits, key=lambda d: int(np.count_nonzero(d["mask"])))
+        else:
+            # Fallback: highest confidence in crop
+            best = max(dets, key=lambda d: d["confidence"])
+
+        polys, area = _extract_polys(best, crop_sm, ox, oy, sx, sy)
+
+        return {
+            "found": True,
+            "segmentation": polys,
+            "area": area,
+            "confidence": float(best["confidence"]),
+            "sam_score": float(best.get("sam_score", 0.0)),
+            "detected_class": best["class"],
+        }
+    except Exception as e:
+        logger.exception("SAM point inference failed")
+        raise HTTPException(500, detail=str(e))
+
+
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+async def _ensure_sam():
+    """Lazy-load SAM3 detector; raise HTTP 500 on failure."""
+    global _sam_detector
     if _sam_detector is None:
         _ensure_src_path()
         try:
@@ -222,59 +360,101 @@ async def api_sam(body: SamBody):
             logger.info("SAM3 loaded for labeler")
         except Exception as e:
             raise HTTPException(500, detail=f"SAM3 load failed: {e}")
+    return _sam_detector
 
+
+def _all_classes() -> list[str]:
+    """Return full class list from config."""
+    _ensure_src_path()
     try:
-        from PIL import Image as PILImage
-        from src.utils import mask_to_polygon
-
-        img = PILImage.open(body.image_path).convert("RGB")
-        W, H = img.size
-
-        dets = _sam_detector.detect_and_segment(
-            image=img,
-            classes=[body.class_name],
-            confidence_threshold=body.sam_threshold,
-        )
-        if not dets:
-            return {"found": False, "message": "No detections above threshold"}
-
-        # Pick detection with highest IoU vs user-drawn bbox
-        best = max(dets, key=lambda d: _iou(d["bbox"], body.bbox))
-        mask = best.get("mask")
-
-        if mask is not None:
-            polys = mask_to_polygon(mask)
-            area = int(np.count_nonzero(mask))
-        else:
-            x1, y1 = body.bbox[0] * W, body.bbox[1] * H
-            x2, y2 = body.bbox[2] * W, body.bbox[3] * H
-            polys = [[x1, y1, x2, y1, x2, y2, x1, y2]]
-            area = int((x2 - x1) * (y2 - y1))
-
-        return {
-            "found": True,
-            "segmentation": polys,
-            "area": area,
-            "confidence": float(best["confidence"]),
-            "sam_score": float(best.get("sam_score", 0.0)),
-        }
-    except Exception as e:
-        logger.exception("SAM inference failed")
-        raise HTTPException(500, detail=str(e))
+        from src.utils import load_config
+        return load_config(_CONFIG_PATH).get("classes", [])
+    except Exception:
+        return []
 
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
+# ── Crop-based SAM helpers ─────────────────────────────────────────────────
+#
+# Strategy: pass ONLY the user-selected region to SAM.
+#
+#   orig image (e.g. 3840×2160)
+#     └─ crop to bbox + padding  →  small region (e.g. 400×300)
+#          └─ downsample if still > _SAM_MAX_DIM  →  SAM input
+#               └─ mask/polygon in SAM space
+#                    └─ scale back  →  crop space
+#                         └─ shift by crop offset  →  original image space
+#
+# This keeps VRAM proportional to the selected bbox, not the whole image.
 
-def _iou(a: list, b: list) -> float:
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    ua = (a[2] - a[0]) * (a[3] - a[1])
-    ub = (b[2] - b[0]) * (b[3] - b[1])
-    union = ua + ub - inter
-    return inter / union if union > 0 else 0.0
+_SAM_MAX_DIM = 1024   # cap on longest side fed to SAM vision encoder
+
+
+def _crop_region(img, bbox_n: list, padding: float = 0.20):
+    """
+    Crop image to a normalized bbox with proportional padding.
+    Returns (crop_img, ox, oy) — ox/oy are the pixel offset of the crop
+    top-left corner in the original image.
+    """
+    from PIL import Image as PILImage
+    W, H = img.size
+    x1n, y1n, x2n, y2n = bbox_n
+    pw = (x2n - x1n) * padding
+    ph = (y2n - y1n) * padding
+    x1 = max(0, int((x1n - pw) * W))
+    y1 = max(0, int((y1n - ph) * H))
+    x2 = min(W, int((x2n + pw) * W))
+    y2 = min(H, int((y2n + ph) * H))
+    return img.crop((x1, y1, x2, y2)), x1, y1
+
+
+def _downsample_for_sam(img):
+    """
+    Resize so longest side ≤ _SAM_MAX_DIM.
+    Returns (resized_img, sx, sy) where sx/sy convert small→crop pixel coords.
+    """
+    from PIL import Image as PILImage
+    W, H = img.size
+    scale = min(_SAM_MAX_DIM / W, _SAM_MAX_DIM / H, 1.0)
+    if scale >= 1.0:
+        return img, 1.0, 1.0
+    nw, nh = int(W * scale), int(H * scale)
+    return img.resize((nw, nh), PILImage.LANCZOS), W / nw, H / nh
+
+
+def _extract_polys(det: dict, crop_sm, ox: int, oy: int, sx: float, sy: float):
+    """
+    Convert a detection's mask (in crop_sm space) to polygons in original image space.
+    Falls back to crop_sm bbox rectangle if no mask.
+    Returns (polys, area).
+    """
+    from src.utils import mask_to_polygon
+    mask = det.get("mask")
+    if mask is not None:
+        polys = mask_to_polygon(mask)           # crop_sm pixel coords
+        area  = int(np.count_nonzero(mask))
+    else:
+        # bbox is normalized inside crop_sm; convert to crop_sm pixels
+        b = det["bbox"]
+        cw, ch = crop_sm.size
+        x1c, y1c = b[0]*cw, b[1]*ch
+        x2c, y2c = b[2]*cw, b[3]*ch
+        polys = [[x1c, y1c, x2c, y1c, x2c, y2c, x1c, y2c]]
+        area  = int((x2c - x1c) * (y2c - y1c))
+
+    # 1. Scale from crop_sm space → crop space
+    if sx != 1.0 or sy != 1.0:
+        polys = [
+            [v * (sx if i % 2 == 0 else sy) for i, v in enumerate(seg)]
+            for seg in polys
+        ]
+        area = int(area * sx * sy)
+
+    # 2. Shift from crop space → original image space
+    polys = [
+        [v + (ox if i % 2 == 0 else oy) for i, v in enumerate(seg)]
+        for seg in polys
+    ]
+    return polys, area
 
 
 def _ensure_src_path():
