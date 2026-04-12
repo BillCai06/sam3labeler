@@ -76,8 +76,25 @@ def main():
         "--auto", action="store_true",
         help="Auto mode: read classes from config (no --classes needed), process sub-folders independently",
     )
+    parser.add_argument(
+        "--labeler", action="store_true",
+        help="Launch manual labeling WebUI",
+    )
 
     args = parser.parse_args()
+
+    # Labeler mode
+    if args.labeler:
+        import uvicorn
+        import webbrowser
+        port = args.port or 7777
+        os.environ["LABELER_CONFIG"] = args.config
+        print(f"\n{'='*50}")
+        print(f"  Labeler  →  http://localhost:{port}")
+        print(f"{'='*50}\n")
+        webbrowser.open(f"http://localhost:{port}", new=2)
+        uvicorn.run("labeler.server:app", host="0.0.0.0", port=port, reload=False)
+        return
 
     # GUI mode
     if args.gui:
