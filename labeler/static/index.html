@@ -126,6 +126,15 @@ body{
 .mbtn:hover{border-color:#8e8e93;color:#e5e5ea}
 .mbtn.on{border-color:#0a84ff;background:#1a3a5a;color:#64d2ff}
 
+/* Dedup button */
+#dedup-btn{
+  width:100%;padding:6px 0;border:none;border-radius:6px;
+  background:#3a1a1a;color:#ff6b6b;cursor:pointer;
+  font:inherit;font-size:11px;font-weight:700;letter-spacing:.3px;
+  border:1px solid #7a2a2a;transition:background .1s;
+}
+#dedup-btn:hover{background:#5a2020;color:#ff9f9f}
+
 /* Run SAM button */
 #run-sam-btn{
   width:100%;padding:7px 0;border:none;border-radius:6px;
@@ -144,6 +153,41 @@ body{
 #rad-row{display:flex;align-items:center;gap:7px;margin-top:4px}
 #rad-slider{flex:1;accent-color:#ff9f0a;cursor:pointer}
 #rad-val{font-size:12px;font-weight:700;min-width:36px;text-align:right;color:#ff9f0a}
+
+/* Proposed panel */
+#prop-sec{display:none}
+#prop-ct{font-size:12px;color:#ffd60a;margin-bottom:4px}
+#prop-btns{display:flex;gap:5px;margin-top:5px}
+#accept-btn{
+  flex:1;padding:5px 0;border:none;border-radius:5px;
+  background:#30d158;color:#000;cursor:pointer;
+  font:inherit;font-size:11px;font-weight:700;
+}
+#accept-btn:hover{background:#4ade80}
+#reject-btn{
+  flex:1;padding:5px 0;border:none;border-radius:5px;
+  background:#636366;color:#fff;cursor:pointer;
+  font:inherit;font-size:11px;font-weight:700;
+}
+#reject-btn:hover{background:#8e8e93}
+
+/* Stack pick menu (right-click) */
+#stack-menu{
+  position:fixed;display:none;z-index:200;
+  background:#2c2c2e;border:1px solid #48484a;border-radius:8px;
+  padding:4px 0;min-width:150px;
+  box-shadow:0 6px 24px rgba(0,0,0,.6);
+  font-size:12px;
+}
+.smrow{
+  padding:5px 12px;cursor:pointer;
+  display:flex;align-items:center;gap:7px;
+  color:#e5e5ea;white-space:nowrap;
+}
+.smrow:hover{background:#3a3a3c}
+.smrow.cur-sel{background:#1c3a5e}
+.smdot{width:10px;height:10px;border-radius:50%;flex-shrink:0;border:1px solid rgba(255,255,255,.2)}
+.smconf{color:#636366;font-size:10px;margin-left:auto;padding-left:8px}
 
 /* Shortcuts */
 .keys{font-size:10px;color:#636366;line-height:1.8}
@@ -225,6 +269,21 @@ body{
       <div id="cpan"></div>
     </div>
 
+    <!-- Dedup -->
+    <div class="sec">
+      <button id="dedup-btn" title="Remove lower-confidence duplicate annotations of the same class (IoU > 0.5)">⊘ Dedup same-class overlaps &nbsp;<kbd style="background:#5a1a1a;color:#ff6b6b;border-radius:3px;padding:0 4px;font-size:9px">Q</kbd></button>
+    </div>
+
+    <!-- Proposed annotations -->
+    <div class="sec" id="prop-sec">
+      <div class="slbl">Proposed (prev frame)</div>
+      <div id="prop-ct"></div>
+      <div id="prop-btns">
+        <button id="accept-btn">✓ Accept <kbd style="background:#1a4a2a;color:#30d158;border-radius:3px;padding:0 4px;font-size:9px">Y</kbd></button>
+        <button id="reject-btn">✗ Reject <kbd style="background:#3a3a3c;color:#8e8e93;border-radius:3px;padding:0 4px;font-size:9px">N</kbd></button>
+      </div>
+    </div>
+
     <!-- Run SAM button -->
     <div class="sec">
       <button id="run-sam-btn" disabled>▶ Run SAM &nbsp;<kbd style="background:#3a2a6a;color:#c0a0ff;border-radius:3px;padding:0 4px;font-size:9px">S</kbd></button>
@@ -240,12 +299,21 @@ body{
         <input type="range" id="sam-slider" min="0.01" max="0.90" step="0.01" value="0.40">
         <span id="sam-val">0.40</span>
       </div>
+      <div style="margin-top:7px">
+        <label style="font-size:11px;color:#8e8e93;cursor:pointer;display:flex;align-items:center;gap:5px">
+          <input type="checkbox" id="auto-prop-chk" onchange="S.autoProp=this.checked">
+          Auto-propagate on next frame
+        </label>
+      </div>
     </div>
 
     <!-- Shortcuts -->
     <div class="sec">
       <div class="slbl">Shortcuts</div>
       <div class="keys">
+        <kbd>Q</kbd> dedup overlaps<br>
+        <kbd>Y</kbd> accept proposed<br>
+        <kbd>N</kbd> reject proposed<br>
         <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo<br>
         <kbd>Space</kbd> toggle overlay<br>
         <kbd>A</kbd>/<kbd>←</kbd> prev image<br>
@@ -324,6 +392,10 @@ const S = {
   history: [],
   historyMax: 50,
 
+  // Cycle selection (click same spot to dig through stacked labels)
+  cycleAt: null,      // {x,y} image coords of last selection click
+  cycleIdx: 0,        // which annotation in the stack is selected
+
   // State flags
   dirty: false,
   midDown: false,
@@ -332,6 +404,11 @@ const S = {
 
   // Config
   classes: [],         // [{name, rgb, hex}]
+
+  // Auto-propagation
+  proposed: [],        // [{class, confidence, segmentation, area}]
+  autoProp: false,     // toggle: auto-run on forward navigation (disabled by default)
+  prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] from last saved frame
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -368,6 +445,24 @@ function render() {
       const cls = cat ? cat.name : 'other';
       const ci  = S.classes.find(c => c.name === cls) || {rgb:'128,128,128'};
       drawAnn(ctx, ann, ci.rgb, S.selected.has(ann.id), S.hovId === ann.id);
+    }
+  }
+
+  // Proposed annotations (gold dashed outline)
+  for (const p of S.proposed) {
+    for (const seg of (p.segmentation||[])) {
+      if (seg.length < 6) continue;
+      ctx.beginPath();
+      ctx.moveTo(seg[0], seg[1]);
+      for (let i=2; i<seg.length; i+=2) ctx.lineTo(seg[i], seg[i+1]);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(255,214,0,0.12)';
+      ctx.fill();
+      ctx.strokeStyle = '#ffd60a';
+      ctx.lineWidth = 2.5 / S.zoom;
+      ctx.setLineDash([8/S.zoom, 4/S.zoom]);
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
   }
 
@@ -478,14 +573,52 @@ function ptInPoly(px, py, seg) {
   return inside;
 }
 
-function hitTest(ix, iy) {
+// Returns ALL annotation IDs at (ix,iy), topmost first
+function hitTestAll(ix, iy) {
+  const hits = [];
   for (let i=S.anns.length-1; i>=0; i--) {
     const ann = S.anns[i];
     for (const seg of (ann.segmentation||[])) {
-      if (ptInPoly(ix, iy, seg)) return ann.id;
+      if (ptInPoly(ix, iy, seg)) { hits.push(ann.id); break; }
     }
   }
-  return null;
+  return hits;
+}
+// Returns only the topmost ID (used for hover)
+function hitTest(ix, iy) {
+  const h = hitTestAll(ix, iy);
+  return h.length ? h[0] : null;
+}
+
+// Click-selection helper: cycle through stacked annotations
+function selectAtPoint(ix, iy, shiftKey) {
+  const hits = hitTestAll(ix, iy);
+  if (!hits.length) return false;  // nothing hit
+
+  if (shiftKey) {
+    // Shift: toggle topmost, reset cycle
+    S.selected.has(hits[0]) ? S.selected.delete(hits[0]) : S.selected.add(hits[0]);
+    S.cycleAt = null;
+  } else {
+    const CYCLE_TOL = 10;  // image-pixel tolerance for "same spot"
+    const samePt = S.cycleAt &&
+                   Math.abs(S.cycleAt.x - ix) < CYCLE_TOL &&
+                   Math.abs(S.cycleAt.y - iy) < CYCLE_TOL;
+    const curSelected = hits.find(id => S.selected.has(id));
+
+    if (samePt && curSelected !== undefined && hits.length > 1) {
+      // Advance cycle
+      const curPos = hits.indexOf(curSelected);
+      S.cycleIdx = (curPos + 1) % hits.length;
+    } else {
+      S.cycleIdx = 0;
+    }
+    S.selected.clear();
+    S.selected.add(hits[S.cycleIdx]);
+    S.cycleAt = {x: ix, y: iy};
+    if (hits.length > 1) flash(`${S.cycleIdx+1} / ${hits.length} stacked — click to cycle`, 1500);
+  }
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -560,16 +693,9 @@ cv.addEventListener('mouseup', e => {
     return;
   }
 
-  // Point mode: click → run SAM at that point
+  // Point mode: click → select or run SAM
   if (e.button === 0 && S.mode === 'point') {
-    const hit = hitTest(ix, iy);
-    if (hit !== null) {
-      // Clicked an existing annotation → select it
-      if (e.shiftKey) {
-        S.selected.has(hit) ? S.selected.delete(hit) : S.selected.add(hit);
-      } else {
-        S.selected.clear(); S.selected.add(hit);
-      }
+    if (selectAtPoint(ix, iy, e.shiftKey)) {
       updateSelUI(); schedRender();
     } else {
       // Empty area → run point segmentation
@@ -599,17 +725,12 @@ cv.addEventListener('mouseup', e => {
     } else {
       // Short drag → selection click
       S.drawStart = S.drawCur = null;
-      const hit = hitTest(ix, iy);
-      if (hit !== null) {
-        if (e.shiftKey) {
-          S.selected.has(hit) ? S.selected.delete(hit) : S.selected.add(hit);
-        } else {
-          S.selected.clear(); S.selected.add(hit);
-        }
+      if (selectAtPoint(ix, iy, e.shiftKey)) {
         updateSelUI();
       } else if (!e.shiftKey) {
         S.selected.clear();
         S.pendingBbox = null;
+        S.cycleAt = null;
         showPendingHint(false);
         updateSelUI();
       }
@@ -670,13 +791,19 @@ document.addEventListener('keydown', async e => {
     e.preventDefault(); deleteSelected();
   } else if ((e.key==='s'||e.key==='S') && !e.ctrlKey) {
     e.preventDefault(); if (S.pendingBbox) await doSam();
+  } else if ((e.key==='q'||e.key==='Q') && !e.ctrlKey) {
+    e.preventDefault(); dedupAnns();
+  } else if ((e.key==='y'||e.key==='Y') && !e.ctrlKey) {
+    e.preventDefault(); acceptProposed();
+  } else if ((e.key==='n'||e.key==='N') && !e.ctrlKey) {
+    e.preventDefault(); rejectProposed();
   } else if (e.key==='f'||e.key==='F') {
     e.preventDefault(); fitCanvas(); schedRender();
   } else if (e.key==='Escape') {
     e.preventDefault();
     S.pendingBbox=null; S.isDrawing=false;
     S.drawStart=S.drawCur=null;
-    S.selected.clear();
+    S.selected.clear(); S.cycleAt=null;
     showPendingHint(false); updateRunSamBtn(); updateSelUI(); schedRender();
   }
 });
@@ -844,8 +971,15 @@ function _commitSamResult(data, className) {
 async function navigate(delta) {
   if (!S.images.length) return;
   await autoSave();
+  const wasIdx = S.idx;
   const ni = Math.max(0, Math.min(S.images.length-1, S.idx+delta));
-  if (ni !== S.idx) await loadImg(ni);
+  if (ni !== wasIdx) {
+    await loadImg(ni);
+    // Auto-propagate forward only (next frame in video sequence)
+    if (S.autoProp && ni === wasIdx + 1 && S.prevItems.length > 0) {
+      triggerPropagate();
+    }
+  }
 }
 
 async function loadImg(idx) {
@@ -854,7 +988,9 @@ async function loadImg(idx) {
   S.selected.clear(); S.pendingBbox=null;
   S.isDrawing=false; S.drawStart=S.drawCur=null;
   S.dirty=false; S.hovId=null; S.history=[];
+  S.proposed=[];
   showPendingHint(false);
+  updatePropUI();
 
   const item = S.images[idx];
 
@@ -920,6 +1056,12 @@ async function autoSave() {
       S.images[S.idx].annCount = S.anns.length;
       flash('Saved ✓', 1200);
       updateListHL();
+      // Capture per-annotation bbox+class for propagation to next frame
+      S.prevItems = S.anns.map(a => {
+        const cls  = S.cats.find(c => c.id === a.category_id)?.name;
+        const bbox = annToBboxNorm(a);
+        return (cls && bbox) ? {class_name: cls, bbox} : null;
+      }).filter(Boolean);
     }
   } catch(err) {
     flash(`Save failed: ${err.message}`);
@@ -1004,6 +1146,159 @@ function updateRunSamBtn() {
   hint.textContent = hasBbox
     ? `Class: ${S.activeClass ?? '(click a class first)'}  →  ▶`
     : S.mode === 'point' ? 'Click on object to segment' : 'Draw bbox first, then click ▶';
+}
+
+// ═══════════════════════════════════════════════════════════
+// DEDUP
+// ═══════════════════════════════════════════════════════════
+function dedupAnns() {
+  function annBbox(ann) {
+    const pts = (ann.segmentation||[]).flat();
+    if (!pts.length) return null;
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    for (let i=0;i<pts.length;i+=2) {
+      minX=Math.min(minX,pts[i]);   maxX=Math.max(maxX,pts[i]);
+      minY=Math.min(minY,pts[i+1]); maxY=Math.max(maxY,pts[i+1]);
+    }
+    return {x1:minX,y1:minY,x2:maxX,y2:maxY};
+  }
+  function bboxIoU(a, b) {
+    const ix1=Math.max(a.x1,b.x1), iy1=Math.max(a.y1,b.y1);
+    const ix2=Math.min(a.x2,b.x2), iy2=Math.min(a.y2,b.y2);
+    const inter=Math.max(0,ix2-ix1)*Math.max(0,iy2-iy1);
+    if (!inter) return 0;
+    const ua=(a.x2-a.x1)*(a.y2-a.y1), ub=(b.x2-b.x1)*(b.y2-b.y1);
+    return inter/(ua+ub-inter);
+  }
+  function annConf(ann) {
+    return ann.attributes?.detection_confidence ?? ann.attributes?.sam_score ?? 0;
+  }
+
+  const toRemove = new Set();
+  for (let i=0; i<S.anns.length; i++) {
+    if (toRemove.has(S.anns[i].id)) continue;
+    const bi = annBbox(S.anns[i]);
+    if (!bi) continue;
+    for (let j=i+1; j<S.anns.length; j++) {
+      if (toRemove.has(S.anns[j].id)) continue;
+      if (S.anns[i].category_id !== S.anns[j].category_id) continue;
+      const bj = annBbox(S.anns[j]);
+      if (!bj) continue;
+      if (bboxIoU(bi, bj) > 0.5) {
+        // Keep higher confidence, remove the other
+        const loser = annConf(S.anns[i]) >= annConf(S.anns[j]) ? S.anns[j].id : S.anns[i].id;
+        toRemove.add(loser);
+      }
+    }
+  }
+
+  if (!toRemove.size) { flash('No duplicates found'); return; }
+  pushHistory();
+  S.anns  = S.anns.filter(a => !toRemove.has(a.id));
+  S.selected.clear(); S.cycleAt = null;
+  S.dirty = true;
+  updateSelUI(); updateAnnCt(); schedRender();
+  flash(`Removed ${toRemove.size} duplicate(s)`);
+}
+
+// ═══════════════════════════════════════════════════════════
+// PROPAGATION
+// ═══════════════════════════════════════════════════════════
+function annToBboxNorm(ann) {
+  const pts = (ann.segmentation || []).flat();
+  if (pts.length < 4 || !S.imgW || !S.imgH) return null;
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  for (let i=0; i<pts.length; i+=2) {
+    minX=Math.min(minX,pts[i]);   maxX=Math.max(maxX,pts[i]);
+    minY=Math.min(minY,pts[i+1]); maxY=Math.max(maxY,pts[i+1]);
+  }
+  return [minX/S.imgW, minY/S.imgH, maxX/S.imgW, maxY/S.imgH];
+}
+
+function segToBbox(segs) {
+  const pts = (segs||[]).flat();
+  if (!pts.length) return [0,0,0,0];
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  for (let i=0; i<pts.length; i+=2) {
+    minX=Math.min(minX,pts[i]);   maxX=Math.max(maxX,pts[i]);
+    minY=Math.min(minY,pts[i+1]); maxY=Math.max(maxY,pts[i+1]);
+  }
+  return [minX, minY, maxX-minX, maxY-minY];
+}
+
+async function triggerPropagate() {
+  const imgPath = S.images[S.idx]?.imagePath;
+  if (!imgPath || !S.prevItems.length) return;
+  const spin = document.getElementById('sam-spin');
+  spin.textContent = '⏳ Propagating…';
+  spin.style.display = 'flex';
+  try {
+    const r = await fetch('/api/propagate', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        image_path: imgPath,
+        items: S.prevItems,
+        sam_threshold: Math.min(S.samThresh, 0.25),
+      }),
+    });
+    const data = await r.json();
+    if (data.found && data.annotations.length) {
+      S.proposed = data.annotations;
+      flash(`${S.proposed.length} proposed  [Y] accept  [N] reject`, 5000);
+    } else {
+      flash('Propagation: nothing found');
+    }
+    updatePropUI();
+    schedRender();
+  } catch(err) {
+    flash(`Propagate error: ${err.message}`);
+  } finally {
+    spin.style.display = 'none';
+    spin.textContent = '⏳ Running SAM…';
+  }
+}
+
+function acceptProposed() {
+  if (!S.proposed.length) return;
+  pushHistory();
+  const imgId = S.imgInfo.id ?? 1;
+  let nid = nextAnnId();
+  for (const p of S.proposed) {
+    const cat = getOrMakeCat(p.class);
+    S.anns.push({
+      id: nid++,
+      image_id: imgId,
+      category_id: cat.id,
+      segmentation: p.segmentation,
+      area: p.area,
+      bbox: segToBbox(p.segmentation),
+      iscrowd: 0,
+      attributes: {detection_confidence: p.confidence, source: 'propagated'},
+    });
+  }
+  const count = S.proposed.length;
+  S.proposed = [];
+  S.dirty = true;
+  updateSelUI(); updateAnnCt(); updatePropUI(); schedRender();
+  flash(`Accepted ${count} propagated annotations`);
+}
+
+function rejectProposed() {
+  if (!S.proposed.length) return;
+  S.proposed = [];
+  updatePropUI(); schedRender();
+  flash('Proposed rejected');
+}
+
+function updatePropUI() {
+  const sec = document.getElementById('prop-sec');
+  const ct  = document.getElementById('prop-ct');
+  if (S.proposed.length > 0) {
+    sec.style.display = 'block';
+    ct.textContent = `${S.proposed.length} detected — review`;
+  } else {
+    sec.style.display = 'none';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1141,6 +1436,9 @@ document.getElementById('ds-sel').addEventListener('change', function(){
 });
 
 document.getElementById('del-btn').addEventListener('click', deleteSelected);
+document.getElementById('dedup-btn').addEventListener('click', dedupAnns);
+document.getElementById('accept-btn').addEventListener('click', acceptProposed);
+document.getElementById('reject-btn').addEventListener('click', rejectProposed);
 
 document.getElementById('run-sam-btn').addEventListener('click', doSam);
 
@@ -1187,6 +1485,7 @@ window.addEventListener('beforeunload', e=>{
   await Promise.all([initDatasets(), initClasses()]);
   updateHud();
   updateRunSamBtn();
+  updatePropUI();
   schedRender();
 })();
 </script>

@@ -338,6 +338,67 @@ async def api_sam_point(body: SamPointBody):
 
 
 # ──────────────────────────────────────────────
+# /api/propagate  — re-detect prev-frame annotations in next frame
+# ──────────────────────────────────────────────
+
+class PropagateItem(BaseModel):
+    class_name: str
+    bbox: list[float]   # [x1n, y1n, x2n, y2n] normalized, from prev frame
+
+
+class PropagateBody(BaseModel):
+    image_path: str
+    items: list[PropagateItem]
+    sam_threshold: float = 0.20
+
+
+@app.post("/api/propagate")
+async def api_propagate(body: PropagateBody):
+    det = await _ensure_sam()
+
+    try:
+        from PIL import Image as PILImage
+
+        img = PILImage.open(body.image_path).convert("RGB")
+        results = []
+
+        for item in body.items:
+            crop, ox, oy = _crop_region(img, item.bbox, padding=0.30)
+            crop_sm, sx, sy = _downsample_for_sam(crop)
+
+            dets = det.detect_and_segment(
+                image=crop_sm,
+                classes=[item.class_name],
+                confidence_threshold=body.sam_threshold,
+            )
+            if not dets:
+                all_cls = _all_classes()
+                for g in _GENERIC_PROBES:
+                    if g not in all_cls:
+                        all_cls.append(g)
+                dets = det.detect_and_segment(
+                    image=crop_sm, classes=all_cls,
+                    confidence_threshold=body.sam_threshold,
+                )
+            if not dets:
+                continue
+
+            best = max(dets, key=lambda d: d["confidence"])
+            polys, area = _extract_polys(best, crop_sm, ox, oy, sx, sy)
+            results.append({
+                "class": item.class_name,
+                "confidence": float(best["confidence"]),
+                "segmentation": polys,
+                "area": area,
+            })
+
+        return {"found": len(results) > 0, "annotations": results}
+    except Exception as e:
+        logger.exception("Propagate inference failed")
+        raise HTTPException(500, detail=str(e))
+
+
+# ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
 
