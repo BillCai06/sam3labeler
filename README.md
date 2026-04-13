@@ -57,8 +57,8 @@ The `sam3_video` backend runs SAM3's CLIP text encoder and DETR detection head; 
 
 ## Requirements
 
-- Linux (tested on Ubuntu 20.04/22.04)
-- NVIDIA GPU with CUDA 12.x
+- Linux (tested on Ubuntu 20.04/22.04/24.04) or WSL2
+- NVIDIA GPU with CUDA 12.x **or** AMD GPU with ROCm 6.x / 7.x
 - conda or mamba
 
 **VRAM guide:**
@@ -72,7 +72,15 @@ The `sam3_video` backend runs SAM3's CLIP text encoder and DETR detection head; 
 
 The default `sam3_video` backend runs on a single 8 GB card. Switch to `backend: "qwen"` for better accuracy on complex scenes (requires 18+ GB).
 
+**AMD APU / unified memory (e.g. Ryzen AI Max):** The full system RAM is exposed as VRAM (~95 GB on a 96 GB system), so VRAM is not a constraint — model size and throughput are.
+
 **Blackwell GPU (RTX PRO 6000, RTX 5090, etc.):** PyTorch 2.7+ with CUDA 12.8 is required for sm_120 support. If you have an older PyTorch, see [Troubleshooting](#troubleshooting).
+
+**AMD ROCm on WSL2:** Requires [librocdxg](https://github.com/ROCm/librocdxg) and these env vars in your shell (set once in `~/.bashrc`):
+```bash
+export HSA_ENABLE_DXG_DETECTION=1    # expose GPU via /dev/dxg instead of /dev/kfd
+export HSA_OVERRIDE_GFX_VERSION=11.0.0  # gfx1151 (RDNA 3.5) → gfx1100 kernel compat
+```
 
 ---
 
@@ -81,7 +89,7 @@ The default `sam3_video` backend runs on a single 8 GB card. Switch to `backend:
 ### 1. Clone / enter the project directory
 
 ```bash
-cd ~/qwen3vl2sam
+cd ~/sam3labeler
 ```
 
 ### 2. Run the setup script
@@ -90,21 +98,38 @@ cd ~/qwen3vl2sam
 bash setup_env.sh
 ```
 
-This creates a conda environment named `qwen3vl2sam`, installs all Python dependencies, and installs SAM2 from Meta's GitHub. It takes 5–10 minutes on first run.
+The script **auto-detects your GPU** and installs the right PyTorch build:
+
+| GPU | Detected by | PyTorch wheel |
+|---|---|---|
+| NVIDIA | `nvidia-smi` | `cu124` / `cu128` (version auto-detected) |
+| AMD | `rocminfo` (incl. WSL2 DXG) | `rocm7.2` (version auto-detected) |
+| None / CPU | fallback | `cpu` |
+
+You can override auto-detection:
+```bash
+bash setup_env.sh --cuda   # force CUDA
+bash setup_env.sh --rocm   # force ROCm
+bash setup_env.sh --cpu    # force CPU
+```
+
+This creates a conda environment named `sam3labeler`, installs all Python dependencies, and installs SAM2 from Meta's GitHub.
 
 If you prefer to do it manually:
 
 ```bash
-conda create -n qwen3vl2sam python=3.11 -y
-conda activate qwen3vl2sam
+conda create -n sam3labeler python=3.11 -y
+conda activate sam3labeler
 
-# PyTorch — pick the URL for your CUDA version
-# CUDA 12.8 (Blackwell / sm_120 support, RTX 5000-series, RTX PRO 6000, etc.):
+# PyTorch — pick one:
+# NVIDIA CUDA 12.8 (Blackwell / sm_120, RTX 5000-series, RTX PRO 6000):
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-# CUDA 12.4:
+# NVIDIA CUDA 12.4:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# CUDA 11.8:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# AMD ROCm 7.2:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+# AMD ROCm 6.3:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.3
 
 # Main dependencies
 pip install -r requirements.txt
@@ -116,7 +141,7 @@ pip install git+https://github.com/facebookresearch/sam2.git
 ### 3. Activate the environment
 
 ```bash
-conda activate qwen3vl2sam
+conda activate sam3labeler
 ```
 
 ### 4. (Optional) SAM1 fallback
@@ -388,7 +413,7 @@ Qwen performs much better with specific, visual descriptions:
 ## Project structure
 
 ```
-qwen3vl2sam/
+sam3labeler/
 ├── config.yaml                       # All settings: models, thresholds, classes
 ├── requirements.txt
 ├── setup_env.sh                      # Automated environment setup
@@ -419,6 +444,31 @@ qwen3vl2sam/
 ---
 
 ## Troubleshooting
+
+**AMD GPU not detected by PyTorch on WSL2**
+Requires [librocdxg](https://github.com/ROCm/librocdxg) and two env vars. Verify with:
+```bash
+HSA_ENABLE_DXG_DETECTION=1 rocminfo | grep "Vendor Name"
+```
+If your GPU appears there, make sure both vars are exported in your shell before running Python:
+```bash
+export HSA_ENABLE_DXG_DETECTION=1
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+python -c "import torch; print(torch.cuda.get_device_name(0))"
+```
+Add them to `~/.bashrc` so they apply to every session.
+
+**`torch.cuda.is_available()` returns `False` on AMD**
+PyTorch uses the CUDA-compatible API for ROCm — `torch.cuda` controls the AMD GPU too. If it returns `False`:
+1. Confirm ROCm sees the GPU: `HSA_ENABLE_DXG_DETECTION=1 rocminfo | grep "Marketing Name"`
+2. Confirm `HSA_OVERRIDE_GFX_VERSION=11.0.0` is set — without it, gfx1151 kernels may not load
+3. Confirm you installed the ROCm PyTorch wheel, not the CUDA one: `python -c "import torch; print(torch.version.hip)"`
+
+**AMD `amdsmi` warning on startup**
+```
+UserWarning: Can't initialize amdsmi - Error code: 34
+```
+Harmless. `amdsmi` is an optional GPU monitoring tool not available in the WSL2 DXG path. Compute is unaffected.
 
 **Blackwell GPU warning: `sm_120 is not compatible with the current PyTorch installation`**
 Your GPU (RTX PRO 6000, RTX 5090, B200, etc.) requires PyTorch 2.7+ with CUDA 12.8.
