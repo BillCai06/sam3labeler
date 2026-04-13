@@ -271,7 +271,12 @@ body{
 
     <!-- Dedup -->
     <div class="sec">
-      <button id="dedup-btn" title="Remove lower-confidence duplicate annotations of the same class (IoU > 0.5)">⊘ Dedup same-class overlaps &nbsp;<kbd style="background:#5a1a1a;color:#ff6b6b;border-radius:3px;padding:0 4px;font-size:9px">Q</kbd></button>
+      <button id="dedup-btn" title="Remove lower-confidence overlapping annotations (any class) above the IoU threshold">⊘ Dedup overlaps &nbsp;<kbd style="background:#5a1a1a;color:#ff6b6b;border-radius:3px;padding:0 4px;font-size:9px">Q</kbd></button>
+      <div style="display:flex;align-items:center;gap:7px;margin-top:5px">
+        <span style="font-size:10px;color:#636366;white-space:nowrap">IoU ≥</span>
+        <input type="range" id="iou-slider" min="0.10" max="0.99" step="0.01" value="0.70" style="flex:1;accent-color:#ff6b6b;cursor:pointer">
+        <span id="iou-val" style="font-size:12px;font-weight:700;min-width:32px;text-align:right;color:#ff6b6b">0.70</span>
+      </div>
     </div>
 
     <!-- Proposed annotations -->
@@ -408,6 +413,7 @@ const S = {
   // Auto-propagation
   proposed: [],        // [{class, confidence, segmentation, area}]
   autoProp: false,     // toggle: auto-run on forward navigation (disabled by default)
+  dedupIoU: 0.70,      // IoU threshold for dedup (applies across all classes)
   prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] from last saved frame
 };
 
@@ -1174,6 +1180,7 @@ function dedupAnns() {
     return ann.attributes?.detection_confidence ?? ann.attributes?.sam_score ?? 0;
   }
 
+  const thresh = S.dedupIoU;
   const toRemove = new Set();
   for (let i=0; i<S.anns.length; i++) {
     if (toRemove.has(S.anns[i].id)) continue;
@@ -1181,24 +1188,23 @@ function dedupAnns() {
     if (!bi) continue;
     for (let j=i+1; j<S.anns.length; j++) {
       if (toRemove.has(S.anns[j].id)) continue;
-      if (S.anns[i].category_id !== S.anns[j].category_id) continue;
       const bj = annBbox(S.anns[j]);
       if (!bj) continue;
-      if (bboxIoU(bi, bj) > 0.5) {
-        // Keep higher confidence, remove the other
+      if (bboxIoU(bi, bj) >= thresh) {
+        // Keep higher confidence regardless of class, remove the other
         const loser = annConf(S.anns[i]) >= annConf(S.anns[j]) ? S.anns[j].id : S.anns[i].id;
         toRemove.add(loser);
       }
     }
   }
 
-  if (!toRemove.size) { flash('No duplicates found'); return; }
+  if (!toRemove.size) { flash(`No overlaps ≥ ${thresh.toFixed(2)} IoU found`); return; }
   pushHistory();
   S.anns  = S.anns.filter(a => !toRemove.has(a.id));
   S.selected.clear(); S.cycleAt = null;
   S.dirty = true;
   updateSelUI(); updateAnnCt(); schedRender();
-  flash(`Removed ${toRemove.size} duplicate(s)`);
+  flash(`Removed ${toRemove.size} overlapping annotation(s) (IoU ≥ ${thresh.toFixed(2)})`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1437,6 +1443,10 @@ document.getElementById('ds-sel').addEventListener('change', function(){
 
 document.getElementById('del-btn').addEventListener('click', deleteSelected);
 document.getElementById('dedup-btn').addEventListener('click', dedupAnns);
+document.getElementById('iou-slider').addEventListener('input', function(){
+  S.dedupIoU = parseFloat(this.value);
+  document.getElementById('iou-val').textContent = S.dedupIoU.toFixed(2);
+});
 document.getElementById('accept-btn').addEventListener('click', acceptProposed);
 document.getElementById('reject-btn').addEventListener('click', rejectProposed);
 
