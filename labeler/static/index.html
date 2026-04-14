@@ -414,7 +414,8 @@ const S = {
   proposed: [],        // [{class, confidence, segmentation, area}]
   autoProp: false,     // toggle: auto-run on forward navigation (disabled by default)
   dedupIoU: 0.70,      // IoU threshold for dedup (applies across all classes)
-  prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] from last saved frame
+  prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] — edited anns from last frame
+  editedIds: new Set(), // IDs of annotations touched (added/modified) this session
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -858,6 +859,7 @@ function assignClass(className) {
       attributes: {detection_confidence:1.0, sam_score:1.0, manual:true},
     });
     S.selected = new Set([nid]);
+    S.editedIds.add(nid);
     S.pendingBbox = null;
     S.dirty = true;
     showPendingHint(false);
@@ -868,7 +870,7 @@ function assignClass(className) {
   } else if (S.selected.size > 0) {
     pushHistory();
     for (const ann of S.anns) {
-      if (S.selected.has(ann.id)) ann.category_id = cat.id;
+      if (S.selected.has(ann.id)) { ann.category_id = cat.id; S.editedIds.add(ann.id); }
     }
     S.dirty = true;
     updateSelUI(); schedRender();
@@ -903,7 +905,11 @@ async function doSam() {
                             bbox:bboxNorm, sam_threshold:S.samThresh}),
     });
     const data = await r.json();
-    if (!data.found) { flash(`SAM: ${data.message||'not found'}`); return; }
+    if (!data.found) {
+      flash(`SAM: ${data.message||'not found'}`);
+      S.pendingBbox = null; showPendingHint(false); updateRunSamBtn(); schedRender();
+      return;
+    }
 
     // If fallback fired and a different class was detected, use it
     const usedClass = data.detected_class || className;
@@ -911,6 +917,7 @@ async function doSam() {
     flash(`SAM: ${usedClass} (${data.confidence.toFixed(2)})`);
   } catch(err) {
     flash(`SAM error: ${err.message}`);
+    S.pendingBbox = null; showPendingHint(false); updateRunSamBtn(); schedRender();
   } finally {
     document.getElementById('sam-spin').style.display = 'none';
   }
@@ -964,6 +971,7 @@ function _commitSamResult(data, className) {
     },
   });
   S.selected = new Set([nid]);
+  S.editedIds.add(nid);
   S.pendingBbox = null;
   S.dirty = true;
   showPendingHint(false);
@@ -995,6 +1003,7 @@ async function loadImg(idx) {
   S.isDrawing=false; S.drawStart=S.drawCur=null;
   S.dirty=false; S.hovId=null; S.history=[];
   S.proposed=[];
+  S.editedIds=new Set();
   showPendingHint(false);
   updatePropUI();
 
@@ -1062,12 +1071,14 @@ async function autoSave() {
       S.images[S.idx].annCount = S.anns.length;
       flash('Saved ✓', 1200);
       updateListHL();
-      // Capture per-annotation bbox+class for propagation to next frame
-      S.prevItems = S.anns.map(a => {
-        const cls  = S.cats.find(c => c.id === a.category_id)?.name;
-        const bbox = annToBboxNorm(a);
-        return (cls && bbox) ? {class_name: cls, bbox} : null;
-      }).filter(Boolean);
+      // Capture ONLY the edited/added annotations for propagation to next frame
+      S.prevItems = S.anns
+        .filter(a => S.editedIds.has(a.id))
+        .map(a => {
+          const cls  = S.cats.find(c => c.id === a.category_id)?.name;
+          const bbox = annToBboxNorm(a);
+          return (cls && bbox) ? {class_name: cls, bbox} : null;
+        }).filter(Boolean);
     }
   } catch(err) {
     flash(`Save failed: ${err.message}`);
@@ -1166,21 +1177,29 @@ function dedupAnns() {
       minX=Math.min(minX,pts[i]);   maxX=Math.max(maxX,pts[i]);
       minY=Math.min(minY,pts[i+1]); maxY=Math.max(maxY,pts[i+1]);
     }
-    return {x1:minX,y1:minY,x2:maxX,y2:maxY};
+    const area = (maxX-minX)*(maxY-minY);
+    return {x1:minX,y1:minY,x2:maxX,y2:maxY,area};
   }
-  function bboxIoU(a, b) {
-    const ix1=Math.max(a.x1,b.x1), iy1=Math.max(a.y1,b.y1);
-    const ix2=Math.min(a.x2,b.x2), iy2=Math.min(a.y2,b.y2);
-    const inter=Math.max(0,ix2-ix1)*Math.max(0,iy2-iy1);
+  function bboxInter(a, b) {
+    return Math.max(0,Math.min(a.x2,b.x2)-Math.max(a.x1,b.x1)) *
+           Math.max(0,Math.min(a.y2,b.y2)-Math.max(a.y1,b.y1));
+  }
+  function bboxIoU(a, b, inter) {
     if (!inter) return 0;
-    const ua=(a.x2-a.x1)*(a.y2-a.y1), ub=(b.x2-b.x1)*(b.y2-b.y1);
-    return inter/(ua+ub-inter);
+    return inter / (a.area + b.area - inter);
+  }
+  // What fraction of the smaller bbox is covered by the larger?
+  function containment(a, b, inter) {
+    const smaller = Math.min(a.area, b.area);
+    return smaller > 0 ? inter / smaller : 0;
   }
   function annConf(ann) {
     return ann.attributes?.detection_confidence ?? ann.attributes?.sam_score ?? 0;
   }
 
-  const thresh = S.dedupIoU;
+  const iouThresh     = S.dedupIoU;
+  const CONTAIN_THRESH = 0.82;  // same-class: remove smaller if 82%+ inside larger
+
   const toRemove = new Set();
   for (let i=0; i<S.anns.length; i++) {
     if (toRemove.has(S.anns[i].id)) continue;
@@ -1190,21 +1209,35 @@ function dedupAnns() {
       if (toRemove.has(S.anns[j].id)) continue;
       const bj = annBbox(S.anns[j]);
       if (!bj) continue;
-      if (bboxIoU(bi, bj) >= thresh) {
-        // Keep higher confidence regardless of class, remove the other
-        const loser = annConf(S.anns[i]) >= annConf(S.anns[j]) ? S.anns[j].id : S.anns[i].id;
-        toRemove.add(loser);
+
+      const inter = bboxInter(bi, bj);
+      if (!inter) continue;
+
+      const iou   = bboxIoU(bi, bj, inter);
+      const sameClass = S.anns[i].category_id === S.anns[j].category_id;
+
+      let loser = null;
+
+      if (iou >= iouThresh) {
+        // High IoU (any class): keep higher confidence
+        loser = annConf(S.anns[i]) >= annConf(S.anns[j]) ? S.anns[j].id : S.anns[i].id;
+
+      } else if (sameClass && containment(bi, bj, inter) >= CONTAIN_THRESH) {
+        // Same class, smaller mostly inside larger: remove the smaller one
+        loser = bi.area <= bj.area ? S.anns[i].id : S.anns[j].id;
       }
+
+      if (loser !== null) toRemove.add(loser);
     }
   }
 
-  if (!toRemove.size) { flash(`No overlaps ≥ ${thresh.toFixed(2)} IoU found`); return; }
+  if (!toRemove.size) { flash('No duplicates found'); return; }
   pushHistory();
   S.anns  = S.anns.filter(a => !toRemove.has(a.id));
   S.selected.clear(); S.cycleAt = null;
   S.dirty = true;
   updateSelUI(); updateAnnCt(); schedRender();
-  flash(`Removed ${toRemove.size} overlapping annotation(s) (IoU ≥ ${thresh.toFixed(2)})`);
+  flash(`Removed ${toRemove.size} duplicate(s)`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1272,7 +1305,7 @@ function acceptProposed() {
   for (const p of S.proposed) {
     const cat = getOrMakeCat(p.class);
     S.anns.push({
-      id: nid++,
+      id: nid,
       image_id: imgId,
       category_id: cat.id,
       segmentation: p.segmentation,
@@ -1281,6 +1314,8 @@ function acceptProposed() {
       iscrowd: 0,
       attributes: {detection_confidence: p.confidence, source: 'propagated'},
     });
+    S.editedIds.add(nid);   // relay: accepted proposals propagate to the next frame too
+    nid++;
   }
   const count = S.proposed.length;
   S.proposed = [];

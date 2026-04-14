@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 # Set by run_batch.py via env var before uvicorn import
 _CONFIG_PATH = os.environ.get("LABELER_CONFIG", "config.yaml")
 
+# Class name aliases — applied automatically when loading per-image JSONs
+_CLASS_ALIASES: dict[str, str] = {
+    "tree": "trees",
+}
+
 # Generic probe classes used when no text class is specified (class-free mode)
 _GENERIC_PROBES = [
     "object", "thing", "item", "structure",
@@ -170,12 +175,21 @@ async def api_image(path: str):
 # /api/annotations  GET + PUT
 # ──────────────────────────────────────────────
 
+def _apply_aliases(data: dict) -> dict:
+    """Rename category names in-place according to _CLASS_ALIASES."""
+    if not _CLASS_ALIASES:
+        return data
+    for cat in data.get("categories", []):
+        cat["name"] = _CLASS_ALIASES.get(cat["name"], cat["name"])
+    return data
+
+
 @app.get("/api/annotations")
 async def api_get_annotations(json_path: str):
     p = Path(json_path)
     if not p.exists():
         return JSONResponse({"images": [], "annotations": [], "categories": []})
-    return JSONResponse(json.loads(p.read_text()))
+    return JSONResponse(_apply_aliases(json.loads(p.read_text())))
 
 
 class SaveBody(BaseModel):
@@ -356,37 +370,47 @@ class PropagateBody(BaseModel):
 async def api_propagate(body: PropagateBody):
     det = await _ensure_sam()
 
+    if not body.items:
+        return {"found": False, "annotations": []}
+
     try:
         from PIL import Image as PILImage
 
         img = PILImage.open(body.image_path).convert("RGB")
-        results = []
 
+        # Build all crops in one pass
+        crops:  list = []
+        metas:  list = []   # (crop_sm, ox, oy, sx, sy, class_name)
         for item in body.items:
-            crop, ox, oy = _crop_region(img, item.bbox, padding=0.30)
+            crop, ox, oy = _crop_region(img, item.bbox, padding=0.40)
             crop_sm, sx, sy = _downsample_for_sam(crop)
+            crops.append(crop_sm)
+            metas.append((crop_sm, ox, oy, sx, sy, item.class_name))
 
-            dets = det.detect_and_segment(
-                image=crop_sm,
-                classes=[item.class_name],
-                confidence_threshold=body.sam_threshold,
-            )
-            if not dets:
-                all_cls = _all_classes()
-                for g in _GENERIC_PROBES:
-                    if g not in all_cls:
-                        all_cls.append(g)
-                dets = det.detect_and_segment(
-                    image=crop_sm, classes=all_cls,
-                    confidence_threshold=body.sam_threshold,
-                )
-            if not dets:
+        # Classes to query: all requested + generic probes as fallback pool.
+        # Include probes so the single batch call can serve as its own fallback.
+        requested = list(dict.fromkeys(m[5] for m in metas))
+        probes    = [g for g in _GENERIC_PROBES if g not in requested]
+        all_cls   = requested + [c for c in _all_classes() if c not in requested] + probes
+
+        # ONE batch forward pass — vision encoder runs once for all N crops
+        batch_results = det.detect_and_segment_batch(
+            images=crops,
+            classes=all_cls,
+            confidence_threshold=body.sam_threshold,
+        )
+
+        results = []
+        for (crop_sm, ox, oy, sx, sy, class_name), dets_for_crop in zip(metas, batch_results):
+            if not dets_for_crop:
                 continue
-
-            best = max(dets, key=lambda d: d["confidence"])
+            # Prefer the requested class; fall back to highest-confidence detection
+            class_dets = [d for d in dets_for_crop if d["class"] == class_name]
+            best = max(class_dets, key=lambda d: d["confidence"]) if class_dets \
+                   else max(dets_for_crop, key=lambda d: d["confidence"])
             polys, area = _extract_polys(best, crop_sm, ox, oy, sx, sy)
             results.append({
-                "class": item.class_name,
+                "class": class_name,
                 "confidence": float(best["confidence"]),
                 "segmentation": polys,
                 "area": area,

@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 CLASS_COLORS: dict[str, tuple] = {
     "trail":      (194, 154, 108),  # tan
     "grass":      ( 52, 199,  89),  # green
-    "tree":       ( 34, 139,  34),  # dark green
-    "branch":     ( 34, 139,  34),  # dark green (same as tree)
+    "tree":       ( 34, 139,  34),  # dark green (alias → trees)
+    "trees":      ( 34, 139,  34),  # dark green
+    "branch":     ( 34, 139,  34),  # dark green
     "underbrush": (107, 142,  35),  # olive
     "mulch":      (101,  67,  33),  # dark brown
     "log":        (139,  90,  43),  # medium brown
