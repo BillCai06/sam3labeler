@@ -252,6 +252,7 @@ body{
       <div class="mode-toggle">
         <button class="mbtn on" id="mode-draw" title="Drag to draw bbox, then click class or press S">✏ Draw</button>
         <button class="mbtn"    id="mode-point" title="Click on object center — SAM auto-segments">● Point</button>
+        <button class="mbtn"    id="mode-polygon" title="Click to place vertices, Enter or dbl-click to close">⬡ Poly</button>
       </div>
       <!-- Point mode: radius control -->
       <div id="rad-sec" style="display:none">
@@ -385,7 +386,7 @@ const S = {
   // SAM
   samThresh: 0.40,
 
-  // Mode: 'draw' | 'point'
+  // Mode: 'draw' | 'point' | 'polygon'
   mode: 'draw',
   pointRadius: 0.12,   // fraction of min(imgW,imgH) used as bbox half-size
   mouseImg: null,      // {x,y} image coords — for point radius circle
@@ -415,6 +416,12 @@ const S = {
   autoProp: false,     // toggle: auto-run on forward navigation (disabled by default)
   dedupIoU: 0.70,      // IoU threshold for dedup (applies across all classes)
   prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] from last saved frame
+
+  // Polygon tool
+  polyPts: [],         // [{x,y}] image-pixel coords — in-progress vertices
+  pendingPoly: null,   // {pts:[{x,y},...]} closed polygon awaiting class assignment
+  // Vertex drag editing (any mode, single selected annotation)
+  dragVtx: null,       // {annId, segIdx, vtxIdx} — vertex being dragged
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -517,6 +524,83 @@ function render() {
     }
   }
 
+  // ── In-progress polygon (cyan, interactive) ─────────────────────
+  if (S.mode === 'polygon' && S.polyPts.length > 0) {
+    const pts = S.polyPts;
+    const lw  = 2 / S.zoom;
+    // Completed edges
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i=1; i<pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth   = lw;
+    ctx.setLineDash([]);
+    ctx.stroke();
+    // Preview line from last vertex to cursor
+    if (S.mouseImg) {
+      ctx.beginPath();
+      ctx.moveTo(pts[pts.length-1].x, pts[pts.length-1].y);
+      ctx.lineTo(S.mouseImg.x, S.mouseImg.y);
+      ctx.strokeStyle = 'rgba(0,212,255,0.5)';
+      ctx.lineWidth   = lw;
+      ctx.setLineDash([5/S.zoom, 3/S.zoom]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // Vertex dots
+    const dotR = 4 / S.zoom;
+    for (let i=0; i<pts.length; i++) {
+      const nearFirst = i === 0 && S.mouseImg && pts.length >= 3 &&
+                        Math.hypot(S.mouseImg.x-pts[0].x, S.mouseImg.y-pts[0].y) <= 8/S.zoom;
+      ctx.beginPath();
+      ctx.arc(pts[i].x, pts[i].y, nearFirst ? dotR*1.7 : dotR, 0, Math.PI*2);
+      ctx.fillStyle = nearFirst ? '#ff9f0a' : '#00d4ff';
+      ctx.fill();
+      if (nearFirst) {
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth   = 1.5 / S.zoom;
+        ctx.stroke();
+      }
+    }
+  }
+
+  // ── Pending polygon (orange dashed, like pending bbox) ───────────
+  if (S.pendingPoly && S.pendingPoly.pts.length >= 3) {
+    const pts = S.pendingPoly.pts;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i=1; i<pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.fillStyle   = 'rgba(255,159,10,0.12)';
+    ctx.fill();
+    ctx.strokeStyle = '#ff9f0a';
+    ctx.lineWidth   = 2.5 / S.zoom;
+    ctx.setLineDash([9/S.zoom, 4/S.zoom]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Vertex dots
+    const hs = 5 / S.zoom;
+    ctx.fillStyle = '#ff9f0a';
+    for (const p of pts) ctx.fillRect(p.x-hs/2, p.y-hs/2, hs, hs);
+  }
+
+  // ── Vertex handles for single-selected annotation ────────────────
+  if (S.selected.size === 1) {
+    const ann = S.anns.find(a => a.id === [...S.selected][0]);
+    if (ann) {
+      const hs = 5 / S.zoom;
+      ctx.fillStyle   = '#ffffff';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth   = 1 / S.zoom;
+      for (const seg of (ann.segmentation||[])) {
+        for (let i=0; i<seg.length; i+=2) {
+          ctx.fillRect(seg[i]-hs, seg[i+1]-hs, hs*2, hs*2);
+          ctx.strokeRect(seg[i]-hs, seg[i+1]-hs, hs*2, hs*2);
+        }
+      }
+    }
+  }
+
   ctx.restore();
 }
 
@@ -596,6 +680,25 @@ function hitTest(ix, iy) {
   return h.length ? h[0] : null;
 }
 
+// Find a polygon vertex handle near (ix,iy) within thresh image-pixels
+function findVertexHandle(ann, ix, iy, thresh) {
+  for (let si = 0; si < (ann.segmentation||[]).length; si++) {
+    const seg = ann.segmentation[si];
+    for (let vi = 0; vi < seg.length; vi += 2) {
+      if (Math.hypot(seg[vi]-ix, seg[vi+1]-iy) <= thresh)
+        return {annId: ann.id, segIdx: si, vtxIdx: vi};
+    }
+  }
+  return null;
+}
+
+// Shoelace formula — area of polygon given [{x,y},...] points
+function polyArea(pts) {
+  let area = 0, n = pts.length;
+  for (let i=0, j=n-1; i<n; j=i++) area += (pts[j].x+pts[i].x)*(pts[j].y-pts[i].y);
+  return Math.abs(area)/2;
+}
+
 // Click-selection helper: cycle through stacked annotations
 function selectAtPoint(ix, iy, shiftKey) {
   const hits = hitTestAll(ix, iy);
@@ -644,6 +747,28 @@ cv.addEventListener('mousedown', e => {
   }
 
   if (e.button === 0) {
+    // ── Vertex drag (any mode, single selection) ──────────────────
+    if (S.selected.size === 1) {
+      const ann = S.anns.find(a => a.id === [...S.selected][0]);
+      const hit = ann ? findVertexHandle(ann, ix, iy, 7/S.zoom) : null;
+      if (hit) { S.dragVtx = hit; return; }
+    }
+    // ── Polygon mode ──────────────────────────────────────────────
+    if (S.mode === 'polygon') {
+      if (S.pendingPoly) return;
+      const pts = S.polyPts;
+      // With no polygon in progress, allow selecting existing annotations
+      if (pts.length === 0 && selectAtPoint(ix, iy, e.shiftKey)) {
+        updateSelUI(); schedRender(); return;
+      }
+      // Close polygon if near first vertex and ≥3 pts
+      if (pts.length >= 3 && Math.hypot(ix-pts[0].x, iy-pts[0].y) <= 8/S.zoom) {
+        closePolygon(); return;
+      }
+      pts.push({x: Math.max(0,Math.min(S.imgW,ix)), y: Math.max(0,Math.min(S.imgH,iy))});
+      updateHud(); schedRender(); return;
+    }
+    // ── Draw mode (existing) ──────────────────────────────────────
     if (S.mode === 'point') return;  // handled on mouseup (click, not drag)
     if (S.pendingBbox) return;       // waiting for class assignment
     S.isDrawing  = true;
@@ -662,14 +787,25 @@ cv.addEventListener('mousemove', e => {
     schedRender(); return;
   }
 
+  // Vertex drag update
+  if (S.dragVtx) {
+    const ann = S.anns.find(a => a.id === S.dragVtx.annId);
+    if (ann) {
+      ann.segmentation[S.dragVtx.segIdx][S.dragVtx.vtxIdx]   = Math.max(0,Math.min(S.imgW,ix));
+      ann.segmentation[S.dragVtx.segIdx][S.dragVtx.vtxIdx+1] = Math.max(0,Math.min(S.imgH,iy));
+    }
+    S.mouseImg = {x:ix, y:iy}; schedRender(); return;
+  }
+
   if (S.isDrawing) {
     S.drawCur = {x:ix, y:iy};
     schedRender(); return;
   }
 
-  // Always track mouse image coords for point mode circle
+  // Always track mouse image coords for point mode circle / polygon preview
   S.mouseImg = {x:ix, y:iy};
   if (S.mode === 'point') { schedRender(); }
+  if (S.mode === 'polygon' && S.polyPts.length > 0) { schedRender(); }
 
   // Hover
   const hit = hitTest(ix, iy);
@@ -697,6 +833,14 @@ cv.addEventListener('mouseup', e => {
     S.midDown = false;
     cv.style.cursor = 'crosshair';
     return;
+  }
+
+  // Commit vertex drag
+  if (e.button === 0 && S.dragVtx) {
+    pushHistory();
+    S.dragVtx = null;
+    S.dirty = true;
+    updateSelUI(); schedRender(); return;
   }
 
   // Point mode: click → select or run SAM
@@ -736,6 +880,7 @@ cv.addEventListener('mouseup', e => {
       } else if (!e.shiftKey) {
         S.selected.clear();
         S.pendingBbox = null;
+        S.pendingPoly = null; S.polyPts = [];
         S.cycleAt = null;
         showPendingHint(false);
         updateSelUI();
@@ -749,6 +894,14 @@ cv.addEventListener('mouseleave', () => {
   S.hovId = null; S.mouseImg = null;
   document.getElementById('ttip').style.display = 'none';
   schedRender();
+});
+
+cv.addEventListener('dblclick', e => {
+  if (S.mode !== 'polygon') return;
+  e.preventDefault();
+  // dblclick fires after mousedown already placed an extra vertex — pop it before closing
+  if (S.polyPts.length >= 4) { S.polyPts.pop(); closePolygon(); }
+  else if (S.polyPts.length >= 3) closePolygon();
 });
 
 cv.addEventListener('wheel', e => {
@@ -805,10 +958,14 @@ document.addEventListener('keydown', async e => {
     e.preventDefault(); rejectProposed();
   } else if (e.key==='f'||e.key==='F') {
     e.preventDefault(); fitCanvas(); schedRender();
+  } else if (e.key==='Enter') {
+    e.preventDefault();
+    if (S.mode === 'polygon' && S.polyPts.length >= 3 && !S.pendingPoly) closePolygon();
   } else if (e.key==='Escape') {
     e.preventDefault();
     S.pendingBbox=null; S.isDrawing=false;
     S.drawStart=S.drawCur=null;
+    S.polyPts=[]; S.pendingPoly=null; S.dragVtx=null;
     S.selected.clear(); S.cycleAt=null;
     showPendingHint(false); updateRunSamBtn(); updateSelUI(); schedRender();
   }
@@ -844,7 +1001,24 @@ function deleteSelected() {
 function assignClass(className) {
   const cat = getOrMakeCat(className);
 
-  if (S.pendingBbox) {
+  if (S.pendingPoly) {
+    pushHistory();
+    const flat = S.pendingPoly.pts.flatMap(p => [p.x, p.y]);
+    const area = polyArea(S.pendingPoly.pts);
+    const nid  = nextAnnId();
+    S.anns.push({
+      id: nid, image_id: S.imgInfo.id ?? 1, category_id: cat.id,
+      segmentation: [flat], area: area, iscrowd: 0,
+      attributes: {detection_confidence:1.0, sam_score:1.0, manual:true},
+    });
+    S.selected = new Set([nid]);
+    S.pendingPoly = null; S.polyPts = [];
+    S.dirty = true;
+    showPendingHint(false); updateRunSamBtn();
+    updateSelUI(); updateAnnCt(); schedRender();
+    flash(`Added: ${className}`);
+
+  } else if (S.pendingBbox) {
     pushHistory();
     const {x1,y1,x2,y2} = S.pendingBbox;
     const nid = nextAnnId();
@@ -884,6 +1058,14 @@ function assignClass(className) {
   document.querySelectorAll('.cbtn').forEach(b => {
     b.classList.toggle('act', b.dataset.cls === className);
   });
+}
+
+function closePolygon() {
+  if (S.polyPts.length < 3) return;
+  S.pendingPoly = {pts: [...S.polyPts]};
+  S.polyPts = [];
+  showPendingHint(true, 'Polygon closed — click a class to assign');
+  updateRunSamBtn(); updateSelUI(); schedRender();
 }
 
 async function doSam() {
@@ -993,6 +1175,7 @@ async function loadImg(idx) {
   S.idx = idx;
   S.selected.clear(); S.pendingBbox=null;
   S.isDrawing=false; S.drawStart=S.drawCur=null;
+  S.polyPts=[]; S.pendingPoly=null; S.dragVtx=null;
   S.dirty=false; S.hovId=null; S.history=[];
   S.proposed=[];
   showPendingHint(false);
@@ -1121,8 +1304,11 @@ function updateListHL() {
   if (cur) cur.scrollIntoView({block:'nearest'});
 }
 
-function showPendingHint(on) {
-  document.getElementById('pending-hint').style.display = on ? 'block' : 'none';
+function showPendingHint(on, msg) {
+  const el = document.getElementById('pending-hint');
+  el.style.display = on ? 'block' : 'none';
+  if (on && msg) el.textContent = msg;
+  else if (on) el.textContent = 'Bbox ready — click a class or press S for SAM';
 }
 
 let _flashTid = null;
@@ -1139,6 +1325,11 @@ function updateHud() {
   const hud = document.getElementById('hud');
   if (S.mode === 'point') {
     hud.textContent = `POINT | r: ${Math.round(S.pointRadius*100)}%  SAM: ${S.samThresh.toFixed(2)}`;
+  } else if (S.mode === 'polygon') {
+    const n = S.polyPts.length;
+    hud.textContent = n === 0
+      ? 'POLYGON | click to place vertices, Enter or dbl-click to close'
+      : `POLYGON | ${n} pts — Enter or click first vertex to close`;
   } else {
     hud.textContent = `DRAW | SAM: ${S.samThresh.toFixed(2)}`;
   }
@@ -1454,14 +1645,18 @@ document.getElementById('run-sam-btn').addEventListener('click', doSam);
 
 document.getElementById('mode-draw').addEventListener('click', () => setMode('draw'));
 document.getElementById('mode-point').addEventListener('click', () => setMode('point'));
+document.getElementById('mode-polygon').addEventListener('click', () => setMode('polygon'));
 
 function setMode(m) {
   S.mode = m;
-  document.getElementById('mode-draw').classList.toggle('on', m === 'draw');
-  document.getElementById('mode-point').classList.toggle('on', m === 'point');
+  document.getElementById('mode-draw').classList.toggle('on',    m === 'draw');
+  document.getElementById('mode-point').classList.toggle('on',   m === 'point');
+  document.getElementById('mode-polygon').classList.toggle('on', m === 'polygon');
   document.getElementById('rad-sec').style.display  = m === 'point' ? 'block' : 'none';
   // Cancel any pending state when switching
   S.pendingBbox = null; S.isDrawing = false; S.drawStart = S.drawCur = null;
+  if (m !== 'polygon') { S.polyPts = []; S.pendingPoly = null; }
+  S.dragVtx = null;
   showPendingHint(false);
   updateRunSamBtn();
   updateHud();
