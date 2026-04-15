@@ -49,3 +49,4 @@ pipeline:
   inference_batch_size: 16
   nms_iou_threshold: 0.5
   sam_score_threshold: 0.35
+  merge_same_class: true

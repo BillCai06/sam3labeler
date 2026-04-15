@@ -11,7 +11,7 @@ from PIL import Image
 
 from .models.sam3_image_detector import Sam3ImageDetector
 from .models.sam3_video_detector import Sam3VideoDetector
-from .utils import apply_nms, load_config
+from .utils import apply_nms, merge_masks_by_class, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ class Pipeline:
         self.confidence_threshold = pipe_cfg.get("confidence_threshold", 0.03)
         self.nms_iou_threshold = pipe_cfg.get("nms_iou_threshold", 0.5)
         self.sam_score_threshold = pipe_cfg.get("sam_score_threshold", 0.0)
+        self.merge_same_class = pipe_cfg.get("merge_same_class", False)
 
         backend = det_cfg.get("backend", "video")
         if backend == "image":
@@ -92,6 +93,11 @@ class Pipeline:
 
         results = apply_nms(raw, self.nms_iou_threshold)
         logger.info(f"After NMS: {len(results)} instances")
+
+        if self.merge_same_class:
+            before = len(results)
+            results = merge_masks_by_class(results)
+            logger.info(f"After class merge: {len(results)}/{before} instances")
 
         if self.sam_score_threshold > 0:
             before = len(results)

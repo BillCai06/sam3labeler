@@ -277,6 +277,10 @@ body{
         <input type="range" id="iou-slider" min="0.10" max="0.99" step="0.01" value="0.70" style="flex:1;accent-color:#ff6b6b;cursor:pointer">
         <span id="iou-val" style="font-size:12px;font-weight:700;min-width:32px;text-align:right;color:#ff6b6b">0.70</span>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:5px;cursor:pointer;user-select:none">
+        <input type="checkbox" id="merge-class-cb" style="accent-color:#ff6b6b;cursor:pointer;width:13px;height:13px">
+        <span style="font-size:10px;color:#8e8e93">Merge same-class masks after dedup</span>
+      </label>
     </div>
 
     <!-- Proposed annotations -->
@@ -414,6 +418,7 @@ const S = {
   proposed: [],        // [{class, confidence, segmentation, area}]
   autoProp: false,     // toggle: auto-run on forward navigation (disabled by default)
   dedupIoU: 0.70,      // IoU threshold for dedup (applies across all classes)
+  mergeClass: false,   // after dedup, union same-class annotations via server
   prevItems: [],       // [{class_name, bbox:[x1n,y1n,x2n,y2n]}] — edited anns from last frame
   editedIds: new Set(), // IDs of annotations touched (added/modified) this session
 };
@@ -799,7 +804,7 @@ document.addEventListener('keydown', async e => {
   } else if ((e.key==='s'||e.key==='S') && !e.ctrlKey) {
     e.preventDefault(); if (S.pendingBbox) await doSam();
   } else if ((e.key==='q'||e.key==='Q') && !e.ctrlKey) {
-    e.preventDefault(); dedupAnns();
+    e.preventDefault(); await dedupAnns();
   } else if ((e.key==='y'||e.key==='Y') && !e.ctrlKey) {
     e.preventDefault(); acceptProposed();
   } else if ((e.key==='n'||e.key==='N') && !e.ctrlKey) {
@@ -1168,7 +1173,7 @@ function updateRunSamBtn() {
 // ═══════════════════════════════════════════════════════════
 // DEDUP
 // ═══════════════════════════════════════════════════════════
-function dedupAnns() {
+async function dedupAnns() {
   function annBbox(ann) {
     const pts = (ann.segmentation||[]).flat();
     if (!pts.length) return null;
@@ -1231,12 +1236,45 @@ function dedupAnns() {
     }
   }
 
+  if (toRemove.size) {
+    pushHistory();
+    S.anns = S.anns.filter(a => !toRemove.has(a.id));
+    S.selected.clear(); S.cycleAt = null;
+    S.dirty = true;
+    updateSelUI(); updateAnnCt(); schedRender();
+  }
+
+  if (S.mergeClass && S.anns.length > 0) {
+    const imgItem = S.images[S.imgIdx];
+    try {
+      const resp = await fetch('/api/merge_class', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          annotations: S.anns,
+          img_width:  imgItem?.width  || 0,
+          img_height: imgItem?.height || 0,
+        }),
+      });
+      const data = await resp.json();
+      if (data.annotations) {
+        const mergedAway = data.original - data.merged;
+        S.anns = data.annotations;
+        S.dirty = true;
+        updateSelUI(); updateAnnCt(); schedRender();
+        if (toRemove.size || mergedAway > 0) {
+          flash(`Removed ${toRemove.size} dup(s), merged ${mergedAway} same-class`);
+        } else {
+          flash('No duplicates found');
+        }
+        return;
+      }
+    } catch(e) {
+      console.error('merge_class failed:', e);
+    }
+  }
+
   if (!toRemove.size) { flash('No duplicates found'); return; }
-  pushHistory();
-  S.anns  = S.anns.filter(a => !toRemove.has(a.id));
-  S.selected.clear(); S.cycleAt = null;
-  S.dirty = true;
-  updateSelUI(); updateAnnCt(); schedRender();
   flash(`Removed ${toRemove.size} duplicate(s)`);
 }
 
@@ -1481,6 +1519,9 @@ document.getElementById('dedup-btn').addEventListener('click', dedupAnns);
 document.getElementById('iou-slider').addEventListener('input', function(){
   S.dedupIoU = parseFloat(this.value);
   document.getElementById('iou-val').textContent = S.dedupIoU.toFixed(2);
+});
+document.getElementById('merge-class-cb').addEventListener('change', function(){
+  S.mergeClass = this.checked;
 });
 document.getElementById('accept-btn').addEventListener('click', acceptProposed);
 document.getElementById('reject-btn').addEventListener('click', rejectProposed);

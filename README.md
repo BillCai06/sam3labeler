@@ -16,7 +16,13 @@ Image + class list
  Class names → bounding boxes + masks in one pass
        │
        ▼
- [NMS + confidence filter]
+ [NMS — remove duplicate detections of the same object]
+       │
+       ▼
+ [Class merge — union same-class masks into one region]  ← merge_same_class
+       │
+       ▼
+ [Confidence + SAM score filter]
        │
        ▼
  COCO JSON  +  visualization images
@@ -131,9 +137,12 @@ pipeline:
   confidence_threshold: 0.35   # post-NMS confidence filter
   sam_score_threshold:  0.35   # SAM mask quality filter
   nms_iou_threshold:    0.5    # NMS overlap threshold
+  merge_same_class:     true   # union same-class masks into one region per class
 ```
 
 Lower `confidence_threshold` (e.g. 0.05) to get more detections at the cost of more false positives. SAM3's DETR scores run 0.05–0.40 by design — don't expect 0.9+ scores.
+
+**`merge_same_class`** — after NMS, any remaining detections of the same class are merged into a single mask using pixel-wise union. Useful for terrain/stuff categories (grass, trail, mud, sky) where multiple overlapping or adjacent detections should form one continuous annotation rather than many separate instances. Set to `false` for countable objects (car, person, robot) if you need individual instances.
 
 ### Output
 
@@ -310,7 +319,7 @@ qwen3vl2sam/
 │   ├── pipeline.py                # detect → NMS → segment orchestration
 │   ├── batch_processor.py         # folder-level batch loop + COCO output
 │   ├── coco_writer.py             # COCO JSON assembly
-│   └── utils.py                   # config loader, NMS, color palette, mask_to_polygon
+│   └── utils.py                   # config loader, NMS, class-mask merge, color palette, mask_to_polygon
 │
 ├── labeler/
 │   ├── server.py                  # FastAPI backend for the labeler
@@ -336,6 +345,8 @@ qwen3vl2sam/
 **Nothing detected?** Lower `confidence_threshold` to 0.05–0.10. SAM3's DETR scores are low by design (0.05–0.40 range).
 
 **Too many false positives?** Raise `confidence_threshold` to 0.50+ and use the labeler's `Q` (dedup) to clean up stacked masks.
+
+**Multiple fragmented masks for the same terrain class?** Enable `merge_same_class: true` in config. This unions all detections of the same class into one annotation per class before writing to COCO — ideal for ground-cover classes like grass, trail, or mud.
 
 **Masks are wrong but objects found?** Run SAM on a manually drawn bbox in the labeler — crop-based inference is more accurate than full-image detection.
 

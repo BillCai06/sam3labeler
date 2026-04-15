@@ -223,6 +223,69 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def merge_masks_by_class(detections: list[dict]) -> list[dict]:
+    """
+    Merge all detections of the same class into a single mask (pixel-wise OR).
+
+    This is the mask-space equivalent of run_batch.py's shapely polygon union:
+    same-class detections that survive NMS are still separate instances — this
+    step collapses them into one continuous region per class.
+
+    Useful for terrain/stuff classes (grass, trail, mud) where multiple
+    overlapping or adjacent detections should be one annotation, not many.
+
+    Metadata policy:
+      - confidence: highest among merged instances
+      - sam_score:  highest among merged instances
+      - bbox:       recomputed from the merged mask extent
+
+    Returns one dict per class (order matches first occurrence).
+    """
+    if not detections:
+        return detections
+
+    by_class: dict[str, list[dict]] = {}
+    for det in detections:
+        by_class.setdefault(det["class"], []).append(det)
+
+    merged = []
+    for cls, dets in by_class.items():
+        if len(dets) == 1:
+            merged.append(dets[0])
+            continue
+
+        combined_mask = None
+        for det in dets:
+            m = det.get("mask")
+            if m is None:
+                continue
+            combined_mask = m if combined_mask is None else (combined_mask | m)
+
+        best_conf = max(d.get("confidence", 0.0) for d in dets)
+        best_score = max(d.get("sam_score", 0.0) for d in dets)
+
+        if combined_mask is not None and combined_mask.any():
+            rows = np.any(combined_mask, axis=1)
+            cols = np.any(combined_mask, axis=0)
+            y1, y2 = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
+            x1, x2 = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
+            h, w = combined_mask.shape
+            bbox = [x1 / w, y1 / h, (x2 + 1) / w, (y2 + 1) / h]
+        else:
+            combined_mask = dets[0].get("mask")
+            bbox = max(dets, key=lambda d: d.get("confidence", 0.0)).get("bbox", [0, 0, 1, 1])
+
+        merged.append({
+            "class": cls,
+            "bbox": bbox,
+            "confidence": best_conf,
+            "mask": combined_mask,
+            "sam_score": best_score,
+        })
+
+    return merged
+
+
 def apply_nms(detections: list[dict], iou_threshold: float = 0.5) -> list[dict]:
     """
     Non-maximum suppression on detections from the same image.

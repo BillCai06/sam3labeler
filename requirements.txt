@@ -12,6 +12,7 @@ scipy>=1.11.0
 
 # COCO utilities
 pycocotools>=2.0.7
+shapely>=2.0.0
 
 # API
 fastapi>=0.111.0

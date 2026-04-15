@@ -192,6 +192,104 @@ async def api_get_annotations(json_path: str):
     return JSONResponse(_apply_aliases(json.loads(p.read_text())))
 
 
+class MergeClassBody(BaseModel):
+    annotations: list[dict]
+    img_width: int
+    img_height: int
+
+
+@app.post("/api/merge_class")
+async def api_merge_class(body: MergeClassBody):
+    """
+    Union same-class polygon annotations using Shapely and return the merged list.
+    Multiple annotations of the same category_id are combined into one (or more,
+    if they are disconnected) polygon via unary_union.
+    """
+    try:
+        from shapely.geometry import Polygon, MultiPolygon
+        from shapely.ops import unary_union
+    except ImportError:
+        raise HTTPException(500, detail="shapely not installed — pip install shapely")
+    from collections import defaultdict
+
+    anns = body.annotations
+    if not anns:
+        return {"annotations": [], "original": 0, "merged": 0}
+
+    by_cat: dict = defaultdict(list)
+    for ann in anns:
+        by_cat[ann.get("category_id")].append(ann)
+
+    result = []
+    new_id = 1
+
+    for cat_id, cat_anns in sorted(by_cat.items()):
+        if len(cat_anns) == 1:
+            a = dict(cat_anns[0])
+            a["id"] = new_id
+            new_id += 1
+            result.append(a)
+            continue
+
+        # Build Shapely polygons from all segmentation rings
+        polys = []
+        for ann in cat_anns:
+            for seg in (ann.get("segmentation") or []):
+                if not isinstance(seg, list) or len(seg) < 6:
+                    continue
+                coords = [(seg[i], seg[i + 1]) for i in range(0, len(seg), 2)]
+                if len(coords) < 3:
+                    continue
+                try:
+                    poly = Polygon(coords)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                    if not poly.is_empty and poly.area > 0:
+                        polys.append(poly)
+                except Exception:
+                    continue
+
+        if not polys:
+            continue
+
+        try:
+            united = unary_union(polys)
+        except Exception:
+            # Union failed — keep originals unchanged
+            for ann in cat_anns:
+                a = dict(ann)
+                a["id"] = new_id
+                new_id += 1
+                result.append(a)
+            continue
+
+        # Take metadata from highest-confidence source annotation
+        best = max(cat_anns, key=lambda a: (
+            (a.get("attributes") or {}).get("detection_confidence", 0) or 0
+        ))
+
+        geoms = list(united.geoms) if isinstance(united, MultiPolygon) else [united]
+        for geom in geoms:
+            if geom.is_empty or geom.area == 0:
+                continue
+            flat = [v for pt in geom.exterior.coords for v in pt]
+            xs = flat[0::2]
+            ys = flat[1::2]
+            result.append({
+                "id": new_id,
+                "image_id": best.get("image_id", 1),
+                "category_id": cat_id,
+                "segmentation": [flat],
+                "area": float(geom.area),
+                "bbox": [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)],
+                "iscrowd": 0,
+                "attributes": best.get("attributes", {}),
+            })
+            new_id += 1
+
+    return {"annotations": result, "original": len(anns), "merged": len(result)}
+
+
 class SaveBody(BaseModel):
     json_path: str
     data: dict
