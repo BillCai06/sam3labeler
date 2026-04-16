@@ -93,11 +93,14 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 # Reduce CUDA memory fragmentation
@@ -700,7 +703,7 @@ def compute_loss(
         # Presence loss
         has_gt = float(K > 0)
         losses["loss_presence"] = losses["loss_presence"] + F.binary_cross_entropy_with_logits(
-            presence[i], torch.tensor([[has_gt]], device=device)
+            presence[i], torch.tensor([has_gt], device=device)
         )
 
         if K == 0:
@@ -870,6 +873,22 @@ class CSVLogger:
 
 
 # ─────────────────────────────────────────────────────────
+# Distributed helpers
+# ─────────────────────────────────────────────────────────
+
+def _reduce_dict(d: dict[str, float], device: torch.device) -> dict[str, float]:
+    """All-reduce a dict of scalar floats across DDP ranks (in-place average)."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return d
+    world = dist.get_world_size()
+    keys = sorted(d.keys())
+    t = torch.tensor([d[k] for k in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= world
+    return {k: float(t[i]) for i, k in enumerate(keys)}
+
+
+# ─────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────
 
@@ -887,13 +906,20 @@ def train_one_epoch(
     writer,
     csv_logger: CSVLogger,
     global_step: list[int],
+    is_main: bool = True,
 ) -> dict[str, float]:
 
     model.train()
     tracker = LossTracker()
     dtype = torch.bfloat16 if "cuda" in str(device) else torch.float32
+    is_ddp = isinstance(model, DDP)
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch", dynamic_ncols=True)
+    # Set epoch for DistributedSampler so shuffling differs each epoch
+    if hasattr(loader.sampler, "set_epoch"):
+        loader.sampler.set_epoch(epoch)
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch",
+                dynamic_ncols=True, disable=not is_main)
     optimizer.zero_grad()
 
     for step, batch in enumerate(pbar):
@@ -944,11 +970,23 @@ def train_one_epoch(
             )
 
         # Gradient accumulation
+        # Use no_sync on non-sync steps to skip expensive all_reduce mid-accumulation
         loss = losses["loss_total"] / cfg.accum_steps
-        if scaler is not None:
-            scaler.scale(loss).backward()
+        sync_step = (step + 1) % cfg.accum_steps == 0
+        ctx = (model.no_sync() if is_ddp and not sync_step
+               else torch.no_grad.__new__(torch.no_grad))  # null context
+        # Simple approach: just call backward; no_sync avoids redundant comms
+        if is_ddp and not sync_step:
+            with model.no_sync():
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
         else:
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         loss_vals = {k: float(v.detach()) for k, v in losses.items()}
         tracker.update(loss_vals)
@@ -968,30 +1006,32 @@ def train_one_epoch(
 
         # Logging
         if global_step[0] % cfg.log_interval == 0 and global_step[0] > 0:
-            means = tracker.means()
-            pbar.set_postfix({
-                "loss": f"{means.get('loss_total', 0):.4f}",
-                "cls": f"{means.get('loss_cls', 0):.4f}",
-                "mask": f"{means.get('loss_mask', 0):.4f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-            })
+            means = _reduce_dict(tracker.means(), device)  # avg across ranks
+            if is_main:
+                pbar.set_postfix({
+                    "loss": f"{means.get('loss_total', 0):.4f}",
+                    "cls": f"{means.get('loss_cls', 0):.4f}",
+                    "mask": f"{means.get('loss_mask', 0):.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                })
 
-            if writer is not None:
-                for k, v in means.items():
-                    writer.add_scalar(f"train/{k}", v, global_step[0])
-                writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step[0])
+                if writer is not None:
+                    for k, v in means.items():
+                        writer.add_scalar(f"train/{k}", v, global_step[0])
+                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step[0])
 
-            csv_logger.log({
+            if is_main:
+                csv_logger.log({
                 "epoch": epoch,
                 "step": global_step[0],
                 "phase": "train",
-                **means,
-                "lr": scheduler.get_last_lr()[0],
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            })
+                    **means,
+                    "lr": scheduler.get_last_lr()[0],
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
             tracker.reset()
 
-    return tracker.means()
+    return _reduce_dict(tracker.means(), device)
 
 
 @torch.no_grad()
@@ -1005,6 +1045,7 @@ def validate(
     device: torch.device,
     writer,
     csv_logger: CSVLogger,
+    is_main: bool = True,
 ) -> dict[str, float]:
 
     model.eval()
@@ -1012,7 +1053,8 @@ def validate(
     iou_scores = []
     dtype = torch.bfloat16 if "cuda" in str(device) else torch.float32
 
-    for batch in tqdm(loader, desc=f"Val   {epoch}", unit="batch", dynamic_ncols=True):
+    for batch in tqdm(loader, desc=f"Val   {epoch}", unit="batch",
+                      dynamic_ncols=True, disable=not is_main):
         pixel_values = batch["pixel_values"].to(device, dtype=dtype)
         class_names = batch["class_names"]
 
@@ -1066,26 +1108,33 @@ def validate(
 
         tracker.update({k: float(v) for k, v in losses.items()})
 
-    means = tracker.means()
-    means["mask_iou"] = float(np.mean(iou_scores)) if iou_scores else 0.0
+    # Aggregate metrics across all ranks
+    means = _reduce_dict(tracker.means(), device)
+    local_iou = float(np.mean(iou_scores)) if iou_scores else 0.0
+    iou_t = torch.tensor(local_iou, device=device)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(iou_t, op=dist.ReduceOp.SUM)
+        iou_t /= dist.get_world_size()
+    means["mask_iou"] = float(iou_t)
 
-    if writer is not None:
-        for k, v in means.items():
-            writer.add_scalar(f"val/{k}", v, epoch)
+    if is_main:
+        if writer is not None:
+            for k, v in means.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
 
-    csv_logger.log({
-        "epoch": epoch,
-        "step": -1,
-        "phase": "val",
-        **means,
-        "lr": "",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+        csv_logger.log({
+            "epoch": epoch,
+            "step": -1,
+            "phase": "val",
+            **means,
+            "lr": "",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
-    logger.info(
-        f"[Val epoch {epoch}] loss={means.get('loss_total', 0):.4f}  "
-        f"mask_iou={means.get('mask_iou', 0):.4f}"
-    )
+        logger.info(
+            f"[Val epoch {epoch}] loss={means.get('loss_total', 0):.4f}  "
+            f"mask_iou={means.get('mask_iou', 0):.4f}"
+        )
     return means
 
 
@@ -1095,7 +1144,8 @@ def validate(
 
 def save_checkpoint(model, processor, optimizer, scheduler, epoch, metrics, path: Path):
     path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(path))
+    raw_model = model.module if isinstance(model, DDP) else model
+    raw_model.save_pretrained(str(path))
     processor.save_pretrained(str(path))
     meta = {
         "epoch": epoch,
@@ -1226,16 +1276,34 @@ def parse_args() -> argparse.Namespace:
 def main():
     cfg = parse_args()
 
-    # Reproducibility
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
+    # ── Distributed setup ─────────────────────────────────
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_dist = local_rank >= 0
+    if is_dist:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        world_size = 1
+        rank = 0
+    is_main = (rank == 0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
+    # Reproducibility
+    random.seed(cfg.seed + rank)   # different seed per rank for data augmentation
+    np.random.seed(cfg.seed + rank)
+    torch.manual_seed(cfg.seed + rank)
+
+    if is_main:
+        logger.info(f"Device: {device}  |  world_size: {world_size}")
 
     out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if is_dist:
+        dist.barrier()  # wait for rank 0 to create dir
 
     # ── Data sources ──────────────────────────────────────
     if cfg.sources:
@@ -1275,17 +1343,26 @@ def main():
     if cfg.freeze_text:
         freeze_module(model, "text")
 
+    # ── Wrap with DDP ─────────────────────────────────────
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     # ── Datasets & loaders ────────────────────────────────
     train_ds = Sam3Dataset(train_samples, processor, mask_size=cfg.mask_size, augment=True)
     val_ds   = Sam3Dataset(val_samples,   processor, mask_size=cfg.mask_size, augment=False)
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_dist else None
+    val_sampler   = DistributedSampler(val_ds,   shuffle=False) if is_dist else None
+
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        train_ds, batch_size=cfg.batch_size,
+        sampler=train_sampler, shuffle=(train_sampler is None),
         num_workers=cfg.num_workers, pin_memory=True,
         collate_fn=collate_fn, drop_last=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        val_ds, batch_size=cfg.batch_size,
+        sampler=val_sampler, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
         collate_fn=collate_fn,
     )
@@ -1313,9 +1390,9 @@ def main():
         cost_giou=cfg.giou_loss_weight,
     )
 
-    # ── Logging ───────────────────────────────────────────
+    # ── Logging (rank 0 only) ─────────────────────────────
     tb_writer = None
-    if not cfg.no_tensorboard:
+    if is_main and not cfg.no_tensorboard:
         try:
             from torch.utils.tensorboard import SummaryWriter
             tb_dir = out_dir / "tb"
@@ -1328,9 +1405,10 @@ def main():
 
     csv_logger = CSVLogger(out_dir / "losses.csv")
 
-    # Save config for reproducibility
-    with open(out_dir / "train_config.json", "w") as f:
-        json.dump(vars(cfg), f, indent=2)
+    # Save config for reproducibility (rank 0 only)
+    if is_main:
+        with open(out_dir / "train_config.json", "w") as f:
+            json.dump(vars(cfg), f, indent=2)
 
     # ── Resume ────────────────────────────────────────────
     start_epoch = 1
@@ -1342,11 +1420,13 @@ def main():
     best_val_loss = float("inf")
     best_val_iou = 0.0
 
-    logger.info("=" * 60)
-    logger.info(f"SAM3 Fine-tuning  |  {cfg.epochs} epochs  |  "
-                f"effective batch = {cfg.batch_size * cfg.accum_steps}")
-    logger.info(f"Output → {out_dir}")
-    logger.info("=" * 60)
+    if is_main:
+        logger.info("=" * 60)
+        logger.info(f"SAM3 Fine-tuning  |  {cfg.epochs} epochs  |  "
+                    f"world_size={world_size}  |  "
+                    f"effective batch = {cfg.batch_size * cfg.accum_steps * world_size}")
+        logger.info(f"Output → {out_dir}")
+        logger.info("=" * 60)
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         train_metrics = train_one_epoch(
@@ -1354,19 +1434,21 @@ def main():
             optimizer, scheduler, scaler,
             matcher, cfg, epoch, device,
             tb_writer, csv_logger, global_step,
+            is_main=is_main,
         )
 
         val_metrics = validate(
             model, processor, val_loader,
             matcher, cfg, epoch, device,
             tb_writer, csv_logger,
+            is_main=is_main,
         )
 
         val_loss = val_metrics.get("loss_total", float("inf"))
         val_iou  = val_metrics.get("mask_iou", 0.0)
 
-        # Best-model checkpoint (by val loss)
-        if val_loss < best_val_loss:
+        # Best-model checkpoint (rank 0 only)
+        if is_main and val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(model, processor, optimizer, scheduler, epoch,
                             val_metrics, out_dir / "best")
@@ -1374,22 +1456,26 @@ def main():
                         f"mask_iou={val_iou:.4f})")
 
         # Periodic checkpoint
-        if epoch % cfg.save_interval == 0:
+        if is_main and epoch % cfg.save_interval == 0:
             save_checkpoint(model, processor, optimizer, scheduler, epoch,
                             val_metrics, out_dir / f"epoch_{epoch:04d}")
 
-    # Final save
-    save_checkpoint(model, processor, optimizer, scheduler, cfg.epochs,
-                    {}, out_dir / "final")
+    # Final save (rank 0 only)
+    if is_main:
+        save_checkpoint(model, processor, optimizer, scheduler, cfg.epochs,
+                        {}, out_dir / "final")
 
-    if tb_writer:
-        tb_writer.close()
+        if tb_writer:
+            tb_writer.close()
 
-    logger.info("=" * 60)
-    logger.info(f"Training complete. Best val_loss={best_val_loss:.4f}")
-    logger.info(f"Best model → {out_dir / 'best'}")
-    logger.info(f"Loss log   → {out_dir / 'losses.csv'}")
-    logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info(f"Training complete. Best val_loss={best_val_loss:.4f}")
+        logger.info(f"Best model → {out_dir / 'best'}")
+        logger.info(f"Loss log   → {out_dir / 'losses.csv'}")
+        logger.info("=" * 60)
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

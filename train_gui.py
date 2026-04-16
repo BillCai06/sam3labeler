@@ -88,6 +88,15 @@ def _best_checkpoint_info(output_dir: str) -> str:
         return f"Checkpoint found but could not load: {e}"
 
 
+def _ema(values, alpha: float = 0.05):
+    """Exponential moving average. Lower alpha = smoother."""
+    out, s = [], None
+    for v in values:
+        s = float(v) if s is None else alpha * float(v) + (1.0 - alpha) * s
+        out.append(s)
+    return out
+
+
 def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
     """Build a 2-row matplotlib figure: (1) losses, (2) mask IoU."""
     fig, axes = plt.subplots(2, 1, figsize=(9, 6), dpi=100, sharex=False)
@@ -114,17 +123,21 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
 
     # --- Top: training losses vs step ---
     if not train_df.empty and "step" in train_df.columns:
+        steps = train_df["step"].to_numpy()
         for col, color in COLORS.items():
-            if col in train_df.columns:
-                ax_loss.plot(
-                    train_df["step"], train_df[col],
-                    label=f"train {col}", color=color, linewidth=1.2, alpha=0.85,
-                )
+            if col not in train_df.columns:
+                continue
+            raw = train_df[col].to_numpy()
+            # raw data: faint thin line for context
+            ax_loss.plot(steps, raw, color=color, linewidth=0.6, alpha=0.2)
+            # smoothed line: solid and prominent
+            smoothed = _ema(raw, alpha=0.05)
+            ax_loss.plot(steps, smoothed,
+                         label=f"train {col}", color=color, linewidth=1.6, alpha=0.9)
 
     # Val total loss as dashed markers (use epoch × steps_per_epoch estimate)
     if not val_df.empty and "loss_total" in val_df.columns and not train_df.empty \
             and "step" in train_df.columns and "epoch" in train_df.columns:
-        # Estimate x position: map val epoch to train step
         ep2step = train_df.groupby("epoch")["step"].max().to_dict()
         val_steps = val_df["epoch"].map(ep2step)
         ax_loss.plot(
@@ -142,7 +155,16 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
     ax_loss.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f"))
 
     # --- Bottom: val mask IoU vs epoch ---
-    if not val_df.empty and "mask_iou" in val_df.columns and "epoch" in val_df.columns:
+    has_iou = (not val_df.empty
+               and "mask_iou" in val_df.columns
+               and "epoch" in val_df.columns
+               and val_df["mask_iou"].notna().any())
+
+    ax_iou.set_xlabel("Epoch", fontsize=9)
+    ax_iou.set_ylabel("Mask IoU", fontsize=9)
+    ax_iou.set_title("Validation mask IoU", fontsize=10)
+
+    if has_iou:
         ax_iou.plot(
             val_df["epoch"], val_df["mask_iou"],
             color="#89dceb", marker="o", markersize=4, linewidth=1.5, label="val mask IoU",
@@ -152,14 +174,17 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
             alpha=0.15, color="#89dceb",
         )
         ax_iou.set_ylim(0, 1)
-
-    ax_iou.set_xlabel("Epoch", fontsize=9)
-    ax_iou.set_ylabel("Mask IoU", fontsize=9)
-    ax_iou.set_title("Validation mask IoU", fontsize=10)
-    handles, labels = ax_iou.get_legend_handles_labels()
-    if handles:
+        handles, labels = ax_iou.get_legend_handles_labels()
         ax_iou.legend(handles, labels, loc="lower right", fontsize=7,
                       facecolor="#1e1e2e", edgecolor="#45475a", labelcolor="#cdd6f4")
+    else:
+        ax_iou.text(0.5, 0.5, "Waiting for first validation epoch…",
+                    ha="center", va="center", transform=ax_iou.transAxes,
+                    color="#6c7086", fontsize=10, style="italic")
+        ax_iou.set_xlim(0, 1)
+        ax_iou.set_ylim(0, 1)
+        ax_iou.tick_params(left=False, bottom=False,
+                           labelleft=False, labelbottom=False)
 
     fig.tight_layout(pad=1.2)
     return fig
@@ -181,11 +206,15 @@ def _build_cmd(
     finetune_ratio, freeze_vision, freeze_text,
     epochs, batch_size, accum_steps, lr, weight_decay, warmup_steps, max_grad_norm,
     cls_w, box_w, giou_w, mask_w, dice_w, presence_w,
-    output_dir, log_interval, save_interval,
+    output_dir, log_interval, save_interval, num_workers, num_gpus,
 ) -> list[str]:
 
     script = str(Path(__file__).parent / "train_sam3.py")
-    cmd = [sys.executable, script]
+    if int(num_gpus) > 1:
+        cmd = [sys.executable, "-m", "torch.distributed.run",
+               "--nproc_per_node", str(int(num_gpus)), script]
+    else:
+        cmd = [sys.executable, script]
 
     # Data sources
     runs = _discover_runs(outputs_dir)
@@ -196,9 +225,9 @@ def _build_cmd(
         for label in selected_sources:
             ann = label2ann.get(label)
             if ann:
-                # image search dirs: outputs_dir + run_dir siblings
+                # primary image search dir is the dataset folder itself
                 ann_path = Path(ann)
-                img_dir = str(ann_path.parent.parent)  # e.g. outputs/
+                img_dir = str(ann_path.parent)
                 sources_args.append(f"{ann}:{img_dir}")
         if sources_args:
             cmd += ["--sources"] + sources_args
@@ -232,8 +261,9 @@ def _build_cmd(
         "--dice_loss_weight",     str(dice_w),
         "--presence_loss_weight", str(presence_w),
         "--output_dir",   output_dir,
-        "--log_interval", str(int(log_interval)),
+        "--log_interval",  str(int(log_interval)),
         "--save_interval", str(int(save_interval)),
+        "--num_workers",   str(int(num_workers)),
     ]
 
     if freeze_vision:
@@ -244,6 +274,18 @@ def _build_cmd(
     return cmd
 
 
+_LOG_MAX_LINES = 500   # keep only last N lines in the UI textbox
+_LOG_YIELD_LINES = 30  # batch: yield after this many new lines …
+_LOG_YIELD_SECS = 2.0  # … or after this many seconds, whichever comes first
+
+
+def _trim_log(log: str) -> str:
+    lines = log.splitlines(keepends=True)
+    if len(lines) > _LOG_MAX_LINES:
+        return "".join(lines[-_LOG_MAX_LINES:])
+    return log
+
+
 def start_training(
     outputs_dir, selected_sources,
     max_train, max_val, val_split, neg_ratio,
@@ -251,13 +293,13 @@ def start_training(
     finetune_ratio, freeze_vision, freeze_text,
     epochs, batch_size, accum_steps, lr, weight_decay, warmup_steps, max_grad_norm,
     cls_w, box_w, giou_w, mask_w, dice_w, presence_w,
-    output_dir, log_interval, save_interval,
+    output_dir, log_interval, save_interval, num_workers, num_gpus,
 ):
     global _proc, _current_output_dir
     _current_output_dir = output_dir
 
     if _proc is not None and _proc.poll() is None:
-        yield "⚠️ Training already running. Stop it first.", pd.DataFrame(), "—"
+        yield "⚠️ Training already running. Stop it first.", _make_loss_figure(pd.DataFrame(), pd.DataFrame()), "—"
         return
 
     cmd = _build_cmd(
@@ -267,7 +309,7 @@ def start_training(
         finetune_ratio, freeze_vision, freeze_text,
         epochs, batch_size, accum_steps, lr, weight_decay, warmup_steps, max_grad_norm,
         cls_w, box_w, giou_w, mask_w, dice_w, presence_w,
-        output_dir, log_interval, save_interval,
+        output_dir, log_interval, save_interval, num_workers, num_gpus,
     )
 
     cmd_str = " ".join(cmd)
@@ -288,22 +330,31 @@ def start_training(
 
     log = f"$ {cmd_str}\n\n"
     last_plot_refresh = time.time()
+    last_yield_time = time.time()
+    pending = 0
     fig = _make_loss_figure(pd.DataFrame(), pd.DataFrame())
+    ckpt_info = "—"
 
     for line in iter(_proc.stdout.readline, ""):
         log += line
+        pending += 1
 
-        # Refresh plot every 15 s
         now = time.time()
+        if pending < _LOG_YIELD_LINES and (now - last_yield_time) < _LOG_YIELD_SECS:
+            continue  # batch: don't yield yet
+
+        # Trim log and refresh plot on a slower cadence
+        log = _trim_log(log)
         if now - last_plot_refresh > 15:
             fig, ckpt_info = refresh_monitor(output_dir)
             last_plot_refresh = now
-        else:
-            ckpt_info = "—"
 
         yield log, fig, ckpt_info
+        last_yield_time = now
+        pending = 0
 
     _proc.wait()
+    log = _trim_log(log)
     fig, ckpt_info = refresh_monitor(output_dir)
     status = "✓ Complete" if _proc.returncode == 0 else f"✗ Exit code {_proc.returncode}"
     yield log + f"\n\n{status}\n", fig, ckpt_info
@@ -332,112 +383,178 @@ def poll_monitor(output_dir: str):
 # ── Presets ────────────────────────────────────────────────
 
 PRESETS = {
+    # ── Single-GPU presets (RTX PRO 6000, 96 GB) ──────────
     "phase1": {
-        "_label": "Phase 1 — Head Only",
+        "_label": "Phase 1 — Head Only  [1× GPU, 96 GB]",
         "_desc": (
-            "**Recommended for ~1600 images.**  "
+            "**Backbone frozen — ~30 GB VRAM @ batch 16, 1 GPU.**  "
             "Vision + text backbone fully frozen.  "
             "Only trains DETR detector head & mask decoder.  "
             "Low overfitting risk, good starting point."
         ),
         "_output_dir": "checkpoints/phase1",
         "_sam3_path":  "sam3",
-        # training
+        # batch=16 / accum=2 → effective 32
         "epochs":       40,
-        "batch_size":   2,
-        "accum_steps":  8,
+        "batch_size":   16,
+        "accum_steps":  2,
         "lr":           5e-4,
         "weight_decay": 0.05,
-        "warmup_steps": 100,
-        # data
+        "warmup_steps": 200,
         "val_split":    0.15,
         "neg_ratio":    0.25,
-        # fine-tune control
         "finetune_ratio":  0.0,
         "freeze_vision":   True,
         "freeze_text":     True,
-        # loss weights
         "cls_loss_weight":      1.0,
         "box_loss_weight":      5.0,
         "giou_loss_weight":     2.0,
         "mask_loss_weight":     3.0,
         "dice_loss_weight":     3.0,
         "presence_loss_weight": 1.0,
-        # advanced
         "neg_ratio_adv":   0.25,
         "max_grad_norm":   1.0,
         "log_interval":    10,
         "save_interval":   5,
+        "num_workers":     4,
+        "num_gpus":        1,
     },
     "phase2": {
-        "_label": "Phase 2 — Light Full Fine-tune",
+        "_label": "Phase 2 — Light Fine-tune  [1× GPU, 96 GB]",
         "_desc": (
-            "**Run after Phase 1 converges.**  "
+            "**Vision unfrozen — ~45 GB VRAM @ batch 8, 1 GPU.**  "
             "Text encoder stays frozen, vision backbone unfreezes at 1% LR.  "
             "Load Phase 1 best checkpoint as starting point."
         ),
         "_output_dir": "checkpoints/phase2",
         "_sam3_path":  "checkpoints/phase1/best",
-        # training
+        # batch=8 / accum=4 → effective 32; vision grads need more VRAM
         "epochs":       10,
-        "batch_size":   2,
-        "accum_steps":  8,
+        "batch_size":   8,
+        "accum_steps":  4,
         "lr":           1e-4,
         "weight_decay": 0.05,
-        "warmup_steps": 50,
-        # data
+        "warmup_steps": 100,
         "val_split":    0.15,
         "neg_ratio":    0.25,
-        # fine-tune control
         "finetune_ratio":  0.01,
         "freeze_vision":   False,
         "freeze_text":     True,
-        # loss weights
         "cls_loss_weight":      1.0,
         "box_loss_weight":      5.0,
         "giou_loss_weight":     2.0,
         "mask_loss_weight":     3.0,
         "dice_loss_weight":     3.0,
         "presence_loss_weight": 1.0,
-        # advanced
         "max_grad_norm":   1.0,
         "log_interval":    10,
         "save_interval":   2,
+        "num_workers":     4,
+        "num_gpus":        1,
     },
     "large": {
-        "_label": "Large Dataset (5000+ images)",
+        "_label": "Large Dataset  [1× GPU, 96 GB]",
         "_desc": (
-            "**For large datasets.**  "
+            "**Full fine-tune — ~50 GB VRAM @ batch 8, 1 GPU.**  "
             "Partial backbone unfreeze (5% LR).  "
             "Balanced loss weights, standard regularization."
         ),
         "_output_dir": "checkpoints/large_ft",
         "_sam3_path":  "sam3",
-        # training
+        # batch=8 / accum=4 → effective 32; full backbone grads
         "epochs":       30,
-        "batch_size":   4,
+        "batch_size":   8,
         "accum_steps":  4,
         "lr":           2e-4,
         "weight_decay": 0.01,
-        "warmup_steps": 200,
-        # data
+        "warmup_steps": 300,
         "val_split":    0.15,
         "neg_ratio":    0.30,
-        # fine-tune control
         "finetune_ratio":  0.05,
         "freeze_vision":   False,
         "freeze_text":     False,
-        # loss weights
         "cls_loss_weight":      1.0,
         "box_loss_weight":      5.0,
         "giou_loss_weight":     2.0,
         "mask_loss_weight":     2.0,
         "dice_loss_weight":     2.0,
         "presence_loss_weight": 1.0,
-        # advanced
         "max_grad_norm":   1.0,
         "log_interval":    10,
         "save_interval":   5,
+        "num_workers":     4,
+        "num_gpus":        1,
+    },
+    # ── Multi-GPU presets (3× H200, 144 GB each, 1.5 TB RAM) ─
+    "h200_phase1": {
+        "_label": "Phase 1 — Head Only  [3× H200, 144 GB]",
+        "_desc": (
+            "**3× H200 (144 GB each, 1.5 TB RAM) — backbone frozen.**  "
+            "batch=64/GPU, accum=1 → effective batch = 192.  "
+            "LR scaled √6× from single-GPU baseline.  "
+            "~3-5 h for 40 epochs total."
+        ),
+        "_output_dir": "checkpoints/phase1_h200",
+        "_sam3_path":  "sam3",
+        # batch=64/GPU, accum=1 → effective 64×3 = 192
+        # LR: 5e-4 × sqrt(192/32) = ~1.2e-3
+        "epochs":       40,
+        "batch_size":   64,
+        "accum_steps":  1,
+        "lr":           1.2e-3,
+        "weight_decay": 0.05,
+        "warmup_steps": 500,   # longer warmup for large effective batch
+        "val_split":    0.15,
+        "neg_ratio":    0.25,
+        "finetune_ratio":  0.0,
+        "freeze_vision":   True,
+        "freeze_text":     True,
+        "cls_loss_weight":      1.0,
+        "box_loss_weight":      5.0,
+        "giou_loss_weight":     2.0,
+        "mask_loss_weight":     3.0,
+        "dice_loss_weight":     3.0,
+        "presence_loss_weight": 1.0,
+        "neg_ratio_adv":   0.25,
+        "max_grad_norm":   1.0,
+        "log_interval":    10,
+        "save_interval":   5,
+        "num_workers":     8,   # 1.5 TB RAM, no constraint
+        "num_gpus":        3,
+    },
+    "h200_phase2": {
+        "_label": "Phase 2 — Light Fine-tune  [3× H200, 144 GB]",
+        "_desc": (
+            "**3× H200 — vision backbone unfrozen.**  "
+            "batch=32/GPU, accum=1 → effective batch = 96.  "
+            "Load Phase 1 H200 checkpoint as starting point."
+        ),
+        "_output_dir": "checkpoints/phase2_h200",
+        "_sam3_path":  "checkpoints/phase1_h200/best",
+        # batch=32/GPU, accum=1 → effective 32×3 = 96
+        # LR: 1e-4 × sqrt(96/32) = ~1.7e-4
+        "epochs":       10,
+        "batch_size":   32,
+        "accum_steps":  1,
+        "lr":           1.7e-4,
+        "weight_decay": 0.05,
+        "warmup_steps": 200,
+        "val_split":    0.15,
+        "neg_ratio":    0.25,
+        "finetune_ratio":  0.01,
+        "freeze_vision":   False,
+        "freeze_text":     True,
+        "cls_loss_weight":      1.0,
+        "box_loss_weight":      5.0,
+        "giou_loss_weight":     2.0,
+        "mask_loss_weight":     3.0,
+        "dice_loss_weight":     3.0,
+        "presence_loss_weight": 1.0,
+        "max_grad_norm":   1.0,
+        "log_interval":    10,
+        "save_interval":   2,
+        "num_workers":     8,
+        "num_gpus":        3,
     },
 }
 
@@ -469,6 +586,8 @@ def _preset_outputs(key: str):
         p["save_interval"],         # save_int_sl
         p["_output_dir"],           # output_dir_box
         p["_sam3_path"],            # sam3_path_box
+        p["num_workers"],           # num_workers_sl
+        p["num_gpus"],              # num_gpus_sl
     )
 
 
@@ -486,7 +605,7 @@ def build_app() -> gr.Blocks:
                 gr.Markdown("### Data Sources")
                 with gr.Row():
                     outputs_dir_box = gr.Textbox(
-                        value="outputs", label="Outputs root dir",
+                        value="/home/bill/qwen3vl2sam/outputs", label="Outputs root dir",
                         info="Directory scanned for run subdirs (each with annotations.json)",
                         scale=3,
                     )
@@ -500,10 +619,16 @@ def build_app() -> gr.Blocks:
 
                 # --- Presets ---
                 gr.Markdown("### Presets")
+                gr.Markdown("**Single GPU (96 GB)**")
                 with gr.Row():
-                    btn_phase1 = gr.Button("Phase 1 — Head Only",         variant="primary",   scale=2)
-                    btn_phase2 = gr.Button("Phase 2 — Light Full",         variant="secondary", scale=2)
-                    btn_large  = gr.Button("Large Dataset (5k+)",           variant="secondary", scale=2)
+                    btn_phase1 = gr.Button("Phase 1 — Head Only",    variant="primary",   scale=2)
+                    btn_phase2 = gr.Button("Phase 2 — Light Fine-tune", variant="secondary", scale=2)
+                    btn_large  = gr.Button("Large Dataset (5k+)",    variant="secondary", scale=2)
+                gr.Markdown("**3× H200 (144 GB · 1.5 TB RAM)**")
+                with gr.Row():
+                    btn_h200_p1 = gr.Button("H200 Phase 1",  variant="primary",   scale=2)
+                    btn_h200_p2 = gr.Button("H200 Phase 2",  variant="secondary", scale=2)
+                    gr.Button("", variant="secondary", scale=2, interactive=False, visible=False)
 
                 preset_info = gr.Markdown(
                     f"**Active preset: {PRESETS['phase1']['_label']}**  \n"
@@ -558,6 +683,18 @@ def build_app() -> gr.Blocks:
                     max_grad_box  = gr.Number(value=1.0, label="Max grad norm", precision=2)
                     log_int_sl    = gr.Slider(5, 200, value=10,  step=5, label="Log interval (steps)")
                     save_int_sl   = gr.Slider(1, 50,  value=5,   step=1, label="Save interval (epochs)")
+                    num_workers_sl = gr.Slider(
+                        0, 8, value=4, step=1,
+                        label="DataLoader workers",
+                        info="Each worker pre-fetches batches into RAM. "
+                             "Keep ≤4 with 32 GB system RAM to avoid OOM.",
+                    )
+                    num_gpus_sl = gr.Slider(
+                        1, 8, value=1, step=1,
+                        label="GPUs (multi-GPU via torchrun)",
+                        info="1 = single GPU. >1 uses torchrun DDP automatically. "
+                             "Batch size is per-GPU; effective total = batch × accum × GPUs.",
+                    )
 
                 gr.Markdown("### Output")
                 output_dir_box = gr.Textbox(
@@ -621,21 +758,37 @@ def build_app() -> gr.Blocks:
             epochs_sl, batch_sl, accum_sl,
             lr_box, wd_box, warmup_sl, max_grad_box,
             cls_w_sl, box_w_sl, giou_w_sl, mask_w_sl, dice_w_sl, pres_w_sl,
-            output_dir_box, log_int_sl, save_int_sl,
+            output_dir_box, log_int_sl, save_int_sl, num_workers_sl, num_gpus_sl,
         ]
+        start_btn.click(
+            fn=lambda: gr.update(active=True),
+            outputs=[timer],
+        )
         start_btn.click(
             fn=start_training,
             inputs=train_inputs,
             outputs=[log_box, loss_plot, ckpt_md],
             show_progress=False,
         ).then(
-            fn=lambda od: refresh_monitor(od)[1],
+            fn=lambda od: (refresh_monitor(od)[1], gr.update(active=False)),
             inputs=[output_dir_box],
-            outputs=[ckpt_md],
+            outputs=[ckpt_md, timer],
         )
 
-        # Stop button
-        stop_btn.click(fn=stop_training, outputs=[log_box])
+        # Stop button — deactivate timer and show status in stop_status row
+        stop_btn.click(
+            fn=stop_training,
+            outputs=[stop_status],
+        ).then(
+            fn=lambda: gr.update(active=False),
+            outputs=[timer],
+        )
+
+        # Make stop_status visible when there's a message
+        stop_btn.click(
+            fn=lambda: gr.update(visible=True),
+            outputs=[stop_status],
+        )
 
         # Manual refresh
         refresh_btn.click(
@@ -644,11 +797,6 @@ def build_app() -> gr.Blocks:
             outputs=[loss_plot, ckpt_md],
         )
 
-        # Auto-refresh timer (activates once training starts)
-        start_btn.click(
-            fn=lambda: gr.update(active=True),
-            outputs=[timer],
-        )
         timer.tick(
             fn=poll_monitor,
             inputs=[output_dir_box],
@@ -664,7 +812,7 @@ def build_app() -> gr.Blocks:
             ft_ratio_sl, freeze_vis_cb, freeze_txt_cb,
             cls_w_sl, box_w_sl, giou_w_sl, mask_w_sl, dice_w_sl, pres_w_sl,
             neg_ratio_sl, max_grad_box, log_int_sl, save_int_sl,
-            output_dir_box, sam3_path_box,
+            output_dir_box, sam3_path_box, num_workers_sl, num_gpus_sl,
         ]
 
         btn_phase1.click(
@@ -677,6 +825,14 @@ def build_app() -> gr.Blocks:
         )
         btn_large.click(
             fn=lambda: _preset_outputs("large"),
+            outputs=_preset_out_components,
+        )
+        btn_h200_p1.click(
+            fn=lambda: _preset_outputs("h200_phase1"),
+            outputs=_preset_out_components,
+        )
+        btn_h200_p2.click(
+            fn=lambda: _preset_outputs("h200_phase2"),
             outputs=_preset_out_components,
         )
 
