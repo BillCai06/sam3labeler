@@ -594,6 +594,11 @@ def build_samples(
     rng = random.Random(seed)
     all_samples = []
 
+    # When max_samples is set, cap how many JSON files we read.
+    # Each image yields at least 1 sample, so reading max_samples files
+    # is a safe upper bound. We shuffle first so we get a random subset.
+    max_images = max_samples  # None = no cap
+
     for source_path, search_dirs in sources:
         source_samples: list[dict] = []
         missing_images = 0
@@ -601,7 +606,16 @@ def build_samples(
         if source_path.is_dir():
             # ── Format B: per-image JSON directory ──────────────
             json_files = sorted(source_path.glob("*.json"))
-            logger.info(f"Loading per-image JSONs from {source_path}  ({len(json_files)} files)")
+            total_files = len(json_files)
+            if max_images is not None and total_files > max_images:
+                rng_files = random.Random(seed)
+                json_files = rng_files.sample(json_files, max_images)
+                logger.info(
+                    f"Loading per-image JSONs from {source_path}  "
+                    f"({max_images}/{total_files} files, capped by --max_train/--max_val)"
+                )
+            else:
+                logger.info(f"Loading per-image JSONs from {source_path}  ({total_files} files)")
             for jf in json_files:
                 try:
                     coco = _load_coco_json(jf)
@@ -770,14 +784,34 @@ def compute_loss(
 
 def load_model(sam3_path: str, device: str):
     from transformers import Sam3Model, Sam3Processor
-    logger.info(f"Loading Sam3Model from: {sam3_path}")
+    path_obj = Path(sam3_path).expanduser().resolve()
+    logger.info(f"Loading Sam3Model from: {path_obj}")
+
+    # Always treat local filesystem paths as local checkpoints.
+    # This avoids accidental Hugging Face Hub repo-id validation errors.
+    if not path_obj.exists():
+        raise FileNotFoundError(
+            f"Model path does not exist: {path_obj}. "
+            f"Use a valid local checkpoint directory (for example: checkpoints/phase1_h200/best) "
+            f"or the base model directory (sam3)."
+        )
+
+    required = ["config.json", "model.safetensors", "processor_config.json"]
+    missing = [name for name in required if not (path_obj / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Checkpoint directory is missing required files: {missing}. "
+            f"Directory checked: {path_obj}"
+        )
+
     load_kwargs = {}
     if "cuda" in device:
         load_kwargs["torch_dtype"] = torch.bfloat16
-    model = Sam3Model.from_pretrained(sam3_path, **load_kwargs)
+    load_kwargs["local_files_only"] = True
+    model = Sam3Model.from_pretrained(str(path_obj), **load_kwargs)
     model.to(device)
     model.train()
-    processor = Sam3Processor.from_pretrained(sam3_path)
+    processor = Sam3Processor.from_pretrained(str(path_obj), local_files_only=True)
     return model, processor
 
 
@@ -860,15 +894,26 @@ class CSVLogger:
 
     def __init__(self, path: Path):
         self.path = path
-        self._header_written = path.exists()
+        self._fieldnames: list | None = None
+        if path.exists():
+            with open(path, newline="") as f:
+                reader = csv.reader(f)
+                try:
+                    self._fieldnames = next(reader)
+                except StopIteration:
+                    pass
 
     def log(self, row: dict):
-        write_header = not self._header_written
+        if self._fieldnames is None:
+            self._fieldnames = list(row.keys())
+            write_header = True
+        else:
+            write_header = False
         with open(self.path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames,
+                                    extrasaction="ignore", restval="")
             if write_header:
                 writer.writeheader()
-                self._header_written = True
             writer.writerow(row)
 
 
@@ -913,6 +958,7 @@ def train_one_epoch(
     tracker = LossTracker()
     dtype = torch.bfloat16 if "cuda" in str(device) else torch.float32
     is_ddp = isinstance(model, DDP)
+    raw_model = model.module if is_ddp else model
 
     # Set epoch for DistributedSampler so shuffling differs each epoch
     if hasattr(loader.sampler, "set_epoch"):
@@ -926,11 +972,6 @@ def train_one_epoch(
         pixel_values = batch["pixel_values"].to(device, dtype=dtype)
         class_names = batch["class_names"]
 
-        # Encode vision features for all images at once
-        with torch.autocast(device_type="cuda" if "cuda" in str(device) else "cpu",
-                            dtype=dtype, enabled="cuda" in str(device)):
-            vision_embeds = model.get_vision_features(pixel_values=pixel_values)
-
         # Get unique classes in this batch and encode text once per class
         unique_classes = list(dict.fromkeys(class_names))  # preserves order
         text_embed_cache: dict[str, torch.Tensor] = {}
@@ -940,7 +981,7 @@ def train_one_epoch(
                 padding="max_length", max_length=32,
             ).to(device)
             with torch.no_grad():
-                embed = model.get_text_features(
+                embed = raw_model.get_text_features(
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
                     return_dict=True,
@@ -952,11 +993,15 @@ def train_one_epoch(
             [text_embed_cache[cn] for cn in class_names], dim=0
         )  # (N, seq, dim)
 
-        # Forward pass with grad enabled on model parameters
+        # Forward pass: pass pixel_values through DDP so the full vision encoder
+        # computation graph is tracked inside DDP's forward. Pre-computing
+        # vision_embeds on raw_model outside DDP's forward caused DDP's backward
+        # hooks to do in-place ops on tensors still needed by autograd (version
+        # mismatch error on the [H*W, C] spatial feature tensor).
         with torch.autocast(device_type="cuda" if "cuda" in str(device) else "cpu",
                             dtype=dtype, enabled="cuda" in str(device)):
             out = model(
-                vision_embeds=vision_embeds,
+                pixel_values=pixel_values,
                 text_embeds=text_embeds,
             )
 
@@ -1026,6 +1071,7 @@ def train_one_epoch(
                 "step": global_step[0],
                 "phase": "train",
                     **means,
+                    "mask_iou": "",
                     "lr": scheduler.get_last_lr()[0],
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 })
@@ -1052,13 +1098,20 @@ def validate(
     tracker = LossTracker()
     iou_scores = []
     dtype = torch.bfloat16 if "cuda" in str(device) else torch.float32
+    raw_model = model.module if isinstance(model, DDP) else model
 
     for batch in tqdm(loader, desc=f"Val   {epoch}", unit="batch",
                       dynamic_ncols=True, disable=not is_main):
         pixel_values = batch["pixel_values"].to(device, dtype=dtype)
         class_names = batch["class_names"]
 
-        vision_embeds = model.get_vision_features(pixel_values=pixel_values)
+        autocast_ctx = torch.autocast(
+            device_type="cuda" if "cuda" in str(device) else "cpu",
+            dtype=dtype, enabled="cuda" in str(device),
+        )
+
+        with autocast_ctx:
+            vision_embeds = raw_model.get_vision_features(pixel_values=pixel_values)
 
         unique_classes = list(dict.fromkeys(class_names))
         text_embed_cache: dict[str, torch.Tensor] = {}
@@ -1067,16 +1120,18 @@ def validate(
                 cls, return_tensors="pt",
                 padding="max_length", max_length=32,
             ).to(device)
-            embed = model.get_text_features(
-                input_ids=tokens.input_ids,
-                attention_mask=tokens.attention_mask,
-                return_dict=True,
-            ).pooler_output
+            with autocast_ctx:
+                embed = raw_model.get_text_features(
+                    input_ids=tokens.input_ids,
+                    attention_mask=tokens.attention_mask,
+                    return_dict=True,
+                ).pooler_output
             text_embed_cache[cls] = embed
 
         text_embeds = torch.cat([text_embed_cache[cn] for cn in class_names], dim=0)
 
-        out = model(vision_embeds=vision_embeds, text_embeds=text_embeds)
+        with autocast_ctx:
+            out = model(vision_embeds=vision_embeds, text_embeds=text_embeds)
         losses = compute_loss(
             out, batch["gt_boxes"], batch["gt_masks"], matcher, cfg, device
         )
@@ -1321,7 +1376,14 @@ def main():
         sys.exit(1)
 
     # ── Build sample list ─────────────────────────────────
-    all_samples = build_samples(sources, max_samples=None, neg_ratio=cfg.neg_ratio, seed=cfg.seed)
+    # If both max_train and max_val are set, cap JSON loading upfront
+    # so we don't read thousands of files just to discard them.
+    _load_cap = None
+    if cfg.max_train and cfg.max_val:
+        _load_cap = cfg.max_train + cfg.max_val
+    elif cfg.max_train:
+        _load_cap = int(cfg.max_train / max(1 - cfg.val_split, 0.01))
+    all_samples = build_samples(sources, max_samples=_load_cap, neg_ratio=cfg.neg_ratio, seed=cfg.seed)
 
     # Train/val split
     n_val = cfg.max_val or max(1, int(len(all_samples) * cfg.val_split))
@@ -1343,9 +1405,22 @@ def main():
     if cfg.freeze_text:
         freeze_module(model, "text")
 
+    # Try to enable gradient checkpointing when backbone is unfrozen.
+    # Not all model classes support this; skip silently if unsupported.
+    if not cfg.freeze_vision or not cfg.freeze_text:
+        for mod in [model] + list(model.children()):
+            if hasattr(mod, "gradient_checkpointing_enable"):
+                try:
+                    mod.gradient_checkpointing_enable()
+                    logger.info(f"Gradient checkpointing enabled on {mod.__class__.__name__}")
+                    break
+                except (ValueError, AttributeError):
+                    pass
+
     # ── Wrap with DDP ─────────────────────────────────────
     if is_dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
 
     # ── Datasets & loaders ────────────────────────────────
     train_ds = Sam3Dataset(train_samples, processor, mask_size=cfg.mask_size, augment=True)

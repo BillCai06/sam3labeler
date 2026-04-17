@@ -14,6 +14,7 @@ Run:
 """
 
 import argparse
+import csv as _csv
 import json
 import os
 import signal
@@ -27,6 +28,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import pandas as pd
 
 # ── Globals ────────────────────────────────────────────────
@@ -60,11 +63,74 @@ def _load_losses(output_dir: str):
     if not csv_path.exists():
         return pd.DataFrame(), pd.DataFrame()
     try:
-        df = pd.read_csv(csv_path)
+        rows = []
+        with open(csv_path, newline="") as _f:
+            _reader = _csv.reader(_f)
+            try:
+                _header = next(_reader)
+            except StopIteration:
+                return pd.DataFrame(), pd.DataFrame()
+            _n = len(_header)
+            for _row in _reader:
+                if len(_row) == _n:
+                    rows.append(dict(zip(_header, _row)))
+                elif len(_row) == _n + 1 and "lr" in _header:
+                    # Val rows written with an extra mask_iou field before lr
+                    _lr_idx = _header.index("lr")
+                    _ext = _header[:_lr_idx] + ["mask_iou"] + _header[_lr_idx:]
+                    rows.append(dict(zip(_ext, _row)))
+        if not rows:
+            return pd.DataFrame(), pd.DataFrame()
+        df = pd.DataFrame(rows)
+        _NON_NUMERIC = {"phase", "timestamp"}
+        for _c in df.columns:
+            if _c not in _NON_NUMERIC:
+                df[_c] = pd.to_numeric(df[_c], errors="coerce")
+
+        # Detect run boundaries: step resets to a lower value → new run.
+        # Compute a cumulative offset so the plot always moves right.
+        if "step" in df.columns:
+            steps = df["step"].fillna(0).reset_index(drop=True)
+            step_offset = pd.Series(0.0, index=steps.index)
+            cumulative = 0.0
+            run_id = pd.Series(0, index=steps.index)
+            current_run = 0
+            for i in range(1, len(steps)):
+                if steps[i] < steps[i - 1]:
+                    cumulative = step_offset[i - 1] + steps[i - 1] + 1
+                    current_run += 1
+                step_offset[i] = cumulative
+                run_id[i] = current_run
+            df = df.reset_index(drop=True)
+            df["run"] = run_id
+            df["step_plot"] = steps + step_offset
+        else:
+            df["run"] = 0
+            df["step_plot"] = pd.Series(range(len(df)), index=df.index)
+
+        if "epoch" in df.columns:
+            epochs = df["epoch"].fillna(0).reset_index(drop=True)
+            ep_offset = pd.Series(0.0, index=epochs.index)
+            cumulative_ep = 0.0
+            for i in range(1, len(epochs)):
+                if epochs[i] < epochs[i - 1]:
+                    cumulative_ep = ep_offset[i - 1] + epochs[i - 1] + 1
+                ep_offset[i] = cumulative_ep
+            df["epoch_plot"] = epochs + ep_offset
+        else:
+            df["epoch_plot"] = pd.Series(range(len(df)), index=df.index)
+
         train = df[df["phase"] == "train"].copy()
         val   = df[df["phase"] == "val"].copy()
+
+        # Run boundary x-positions for vertical markers
+        boundaries = df[df["run"] > 0].groupby("run")["step_plot"].first().tolist()
+        train.attrs["run_boundaries"] = boundaries
+        val.attrs["run_boundaries"]   = boundaries
+
         return train, val
-    except Exception:
+    except Exception as e:
+        import traceback; traceback.print_exc()
         return pd.DataFrame(), pd.DataFrame()
 
 
@@ -99,7 +165,9 @@ def _ema(values, alpha: float = 0.05):
 
 def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
     """Build a 2-row matplotlib figure: (1) losses, (2) mask IoU."""
-    fig, axes = plt.subplots(2, 1, figsize=(9, 6), dpi=100, sharex=False)
+    fig = Figure(figsize=(9, 6), dpi=100)
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(2, 1, sharex=False)
     fig.patch.set_facecolor("#1e1e2e")
     for ax in axes:
         ax.set_facecolor("#262637")
@@ -121,25 +189,33 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
         "loss_giou":  "#f9e2af",   # yellow
     }
 
+    run_boundaries = train_df.attrs.get("run_boundaries", []) if not train_df.empty else []
+
+    def _draw_run_boundaries(ax, boundaries, ymin, ymax):
+        for i, x in enumerate(boundaries):
+            ax.axvline(x, color="#6c7086", linewidth=0.8, linestyle="--", alpha=0.6)
+            ax.text(x + (ymax - ymin) * 0.002, ymax * 0.97,
+                    f"run {i + 2}", color="#6c7086", fontsize=6, va="top")
+
     # --- Top: training losses vs step ---
-    if not train_df.empty and "step" in train_df.columns:
-        steps = train_df["step"].to_numpy()
+    step_col = "step_plot" if "step_plot" in train_df.columns else "step"
+    if not train_df.empty and step_col in train_df.columns:
+        steps = train_df[step_col].to_numpy()
         for col, color in COLORS.items():
             if col not in train_df.columns:
                 continue
             raw = train_df[col].to_numpy()
-            # raw data: faint thin line for context
             ax_loss.plot(steps, raw, color=color, linewidth=0.6, alpha=0.2)
-            # smoothed line: solid and prominent
             smoothed = _ema(raw, alpha=0.05)
             ax_loss.plot(steps, smoothed,
                          label=f"train {col}", color=color, linewidth=1.6, alpha=0.9)
 
-    # Val total loss as dashed markers (use epoch × steps_per_epoch estimate)
+    # Val total loss — map via step_plot offsets
+    ep_col = "epoch_plot" if "epoch_plot" in val_df.columns else "epoch"
     if not val_df.empty and "loss_total" in val_df.columns and not train_df.empty \
-            and "step" in train_df.columns and "epoch" in train_df.columns:
-        ep2step = train_df.groupby("epoch")["step"].max().to_dict()
-        val_steps = val_df["epoch"].map(ep2step)
+            and step_col in train_df.columns and ep_col in train_df.columns:
+        ep2step = train_df.groupby(ep_col)[step_col].max().to_dict()
+        val_steps = val_df[ep_col].map(ep2step)
         ax_loss.plot(
             val_steps, val_df["loss_total"],
             label="val total", color="#cba6f7",
@@ -148,6 +224,9 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
 
     ax_loss.set_ylabel("Loss", fontsize=9)
     ax_loss.set_title("Loss curves", fontsize=10)
+    if run_boundaries:
+        ymin, ymax = ax_loss.get_ylim()
+        _draw_run_boundaries(ax_loss, run_boundaries, ymin, ymax)
     handles, labels = ax_loss.get_legend_handles_labels()
     if handles:
         ax_loss.legend(handles, labels, loc="upper right", fontsize=7,
@@ -157,23 +236,28 @@ def _make_loss_figure(train_df: pd.DataFrame, val_df: pd.DataFrame):
     # --- Bottom: val mask IoU vs epoch ---
     has_iou = (not val_df.empty
                and "mask_iou" in val_df.columns
-               and "epoch" in val_df.columns
+               and ep_col in val_df.columns
                and val_df["mask_iou"].notna().any())
 
-    ax_iou.set_xlabel("Epoch", fontsize=9)
+    ax_iou.set_xlabel("Epoch (cumulative)", fontsize=9)
     ax_iou.set_ylabel("Mask IoU", fontsize=9)
     ax_iou.set_title("Validation mask IoU", fontsize=10)
 
     if has_iou:
         ax_iou.plot(
-            val_df["epoch"], val_df["mask_iou"],
+            val_df[ep_col], val_df["mask_iou"],
             color="#89dceb", marker="o", markersize=4, linewidth=1.5, label="val mask IoU",
         )
         ax_iou.fill_between(
-            val_df["epoch"], val_df["mask_iou"],
+            val_df[ep_col], val_df["mask_iou"],
             alpha=0.15, color="#89dceb",
         )
         ax_iou.set_ylim(0, 1)
+        if run_boundaries:
+            ep_boundaries = val_df.groupby(
+                val_df["run"] if "run" in val_df.columns else pd.Series(0, index=val_df.index)
+            )[ep_col].first().iloc[1:].tolist() if "run" in val_df.columns else []
+            _draw_run_boundaries(ax_iou, ep_boundaries, 0, 1)
         handles, labels = ax_iou.get_legend_handles_labels()
         ax_iou.legend(handles, labels, loc="lower right", fontsize=7,
                       facecolor="#1e1e2e", edgecolor="#45475a", labelcolor="#cdd6f4")
@@ -384,6 +468,41 @@ def poll_monitor(output_dir: str):
 
 PRESETS = {
     # ── Single-GPU presets (RTX PRO 6000, 96 GB) ──────────
+    "test_8gpu": {
+        "_label": "Multi-GPU Smoke Test  [8× H200]",
+        "_desc": (
+            "**100 images · 2 epochs · 8 GPU** — verifies DDP, dataloader, "
+            "and full forward/backward pass without committing to a long run.  "
+            "Backbone frozen, tiny batch, no checkpoint saved after epoch 1."
+        ),
+        "_output_dir": "checkpoints/test_8gpu",
+        "_sam3_path":  "sam3",
+        "max_train":   85,
+        "max_val":     15,
+        "epochs":       2,
+        "batch_size":   8,
+        "accum_steps":  1,
+        "lr":           1.2e-3,
+        "weight_decay": 0.05,
+        "warmup_steps": 10,
+        "val_split":    0.15,
+        "neg_ratio":    0.25,
+        "finetune_ratio":  0.0,
+        "freeze_vision":   True,
+        "freeze_text":     True,
+        "cls_loss_weight":      1.0,
+        "box_loss_weight":      5.0,
+        "giou_loss_weight":     2.0,
+        "mask_loss_weight":     3.0,
+        "dice_loss_weight":     3.0,
+        "presence_loss_weight": 1.0,
+        "neg_ratio_adv":   0.25,
+        "max_grad_norm":   1.0,
+        "log_interval":    1,
+        "save_interval":   999,
+        "num_workers":     8,
+        "num_gpus":        8,
+    },
     "phase1": {
         "_label": "Phase 1 — Head Only  [1× GPU, 96 GB]",
         "_desc": (
@@ -394,6 +513,8 @@ PRESETS = {
         ),
         "_output_dir": "checkpoints/phase1",
         "_sam3_path":  "sam3",
+        "max_train":   0,
+        "max_val":     0,
         # batch=16 / accum=2 → effective 32
         "epochs":       40,
         "batch_size":   16,
@@ -428,6 +549,8 @@ PRESETS = {
         ),
         "_output_dir": "checkpoints/phase2",
         "_sam3_path":  "checkpoints/phase1/best",
+        "max_train":   0,
+        "max_val":     0,
         # batch=8 / accum=4 → effective 32; vision grads need more VRAM
         "epochs":       10,
         "batch_size":   8,
@@ -461,6 +584,8 @@ PRESETS = {
         ),
         "_output_dir": "checkpoints/large_ft",
         "_sam3_path":  "sam3",
+        "max_train":   0,
+        "max_val":     0,
         # batch=8 / accum=4 → effective 32; full backbone grads
         "epochs":       30,
         "batch_size":   8,
@@ -485,25 +610,27 @@ PRESETS = {
         "num_workers":     4,
         "num_gpus":        1,
     },
-    # ── Multi-GPU presets (3× H200, 144 GB each, 1.5 TB RAM) ─
+    # ── Multi-GPU presets (8× H200, 144 GB each, 1.5 TB RAM) ─
     "h200_phase1": {
-        "_label": "Phase 1 — Head Only  [3× H200, 144 GB]",
+        "_label": "Phase 1 — Head Only  [8× H200, 144 GB]",
         "_desc": (
-            "**3× H200 (144 GB each, 1.5 TB RAM) — backbone frozen.**  "
-            "batch=64/GPU, accum=1 → effective batch = 192.  "
-            "LR scaled √6× from single-GPU baseline.  "
-            "~3-5 h for 40 epochs total."
+            "**8× H200 (144 GB each, 1.5 TB RAM) — backbone frozen.**  "
+            "batch=64/GPU, accum=1 → effective batch = 512.  "
+            "LR scaled √16× from single-GPU baseline.  "
+            "~1-2 h for 40 epochs total."
         ),
         "_output_dir": "checkpoints/phase1_h200",
         "_sam3_path":  "sam3",
-        # batch=64/GPU, accum=1 → effective 64×3 = 192
-        # LR: 5e-4 × sqrt(192/32) = ~1.2e-3
+        "max_train":   0,
+        "max_val":     0,
+        # batch=64/GPU, accum=1 → effective 64×8 = 512
+        # LR: 5e-4 × sqrt(512/32) = 5e-4 × 4 = 2e-3
         "epochs":       40,
         "batch_size":   64,
         "accum_steps":  1,
-        "lr":           1.2e-3,
+        "lr":           2e-3,
         "weight_decay": 0.05,
-        "warmup_steps": 500,   # longer warmup for large effective batch
+        "warmup_steps": 1000,
         "val_split":    0.15,
         "neg_ratio":    0.25,
         "finetune_ratio":  0.0,
@@ -519,26 +646,29 @@ PRESETS = {
         "max_grad_norm":   1.0,
         "log_interval":    10,
         "save_interval":   5,
-        "num_workers":     8,   # 1.5 TB RAM, no constraint
-        "num_gpus":        3,
+        "num_workers":     8,
+        "num_gpus":        8,
     },
     "h200_phase2": {
-        "_label": "Phase 2 — Light Fine-tune  [3× H200, 144 GB]",
+        "_label": "Phase 2 — Light Fine-tune  [8× H200, 144 GB]",
         "_desc": (
-            "**3× H200 — vision backbone unfrozen.**  "
-            "batch=32/GPU, accum=1 → effective batch = 96.  "
+            "**8× H200 — vision backbone unfrozen, gradient checkpointing on.**  "
+            "batch=8/GPU × accum=4 → effective batch = 256.  "
             "Load Phase 1 H200 checkpoint as starting point."
         ),
         "_output_dir": "checkpoints/phase2_h200",
         "_sam3_path":  "checkpoints/phase1_h200/best",
-        # batch=32/GPU, accum=1 → effective 32×3 = 96
-        # LR: 1e-4 × sqrt(96/32) = ~1.7e-4
-        "epochs":       10,
-        "batch_size":   32,
-        "accum_steps":  1,
-        "lr":           1.7e-4,
+        "max_train":   0,
+        "max_val":     0,
+        # batch=8/GPU (gradient checkpointing saves ~3x VRAM vs batch=32)
+        # accum=4 → effective 8×8×4 = 256
+        # LR: 1e-4 × sqrt(256/32) = ~2.8e-4
+        "epochs":       15,
+        "batch_size":   8,
+        "accum_steps":  4,
+        "lr":           2.8e-4,
         "weight_decay": 0.05,
-        "warmup_steps": 200,
+        "warmup_steps": 500,
         "val_split":    0.15,
         "neg_ratio":    0.25,
         "finetune_ratio":  0.01,
@@ -554,7 +684,7 @@ PRESETS = {
         "log_interval":    10,
         "save_interval":   2,
         "num_workers":     8,
-        "num_gpus":        3,
+        "num_gpus":        8,
     },
 }
 
@@ -588,6 +718,8 @@ def _preset_outputs(key: str):
         p["_sam3_path"],            # sam3_path_box
         p["num_workers"],           # num_workers_sl
         p["num_gpus"],              # num_gpus_sl
+        p.get("max_train", 0),      # max_train_box
+        p.get("max_val",   0),      # max_val_box
     )
 
 
@@ -605,7 +737,7 @@ def build_app() -> gr.Blocks:
                 gr.Markdown("### Data Sources")
                 with gr.Row():
                     outputs_dir_box = gr.Textbox(
-                        value="/home/bill/qwen3vl2sam/outputs", label="Outputs root dir",
+                        value="/home/sc3568/sam3labeler/outputs", label="Outputs root dir",
                         info="Directory scanned for run subdirs (each with annotations.json)",
                         scale=3,
                     )
@@ -624,10 +756,15 @@ def build_app() -> gr.Blocks:
                     btn_phase1 = gr.Button("Phase 1 — Head Only",    variant="primary",   scale=2)
                     btn_phase2 = gr.Button("Phase 2 — Light Fine-tune", variant="secondary", scale=2)
                     btn_large  = gr.Button("Large Dataset (5k+)",    variant="secondary", scale=2)
-                gr.Markdown("**3× H200 (144 GB · 1.5 TB RAM)**")
+                gr.Markdown("**8× H200 (144 GB · 1.5 TB RAM)**")
                 with gr.Row():
                     btn_h200_p1 = gr.Button("H200 Phase 1",  variant="primary",   scale=2)
                     btn_h200_p2 = gr.Button("H200 Phase 2",  variant="secondary", scale=2)
+                    gr.Button("", variant="secondary", scale=2, interactive=False, visible=False)
+                gr.Markdown("**8× H200 — Multi-GPU**")
+                with gr.Row():
+                    btn_test_8gpu = gr.Button("🧪 Smoke Test (100 imgs · 8 GPU)", variant="primary", scale=2)
+                    gr.Button("", variant="secondary", scale=2, interactive=False, visible=False)
                     gr.Button("", variant="secondary", scale=2, interactive=False, visible=False)
 
                 preset_info = gr.Markdown(
@@ -639,7 +776,7 @@ def build_app() -> gr.Blocks:
                 gr.Markdown("### Training Parameters")
                 with gr.Row():
                     epochs_sl   = gr.Slider(1, 200, value=40,  step=1,  label="Epochs")
-                    batch_sl    = gr.Slider(1, 32,  value=2,   step=1,  label="Batch size")
+                    batch_sl    = gr.Slider(1, 64,  value=2,   step=1,  label="Batch size")
                     accum_sl    = gr.Slider(1, 64,  value=8,   step=1,  label="Accum steps")
 
                 with gr.Row():
@@ -681,8 +818,8 @@ def build_app() -> gr.Blocks:
                     mask_size_sl  = gr.Slider(64, 512, value=288, step=32, label="Mask size")
                     neg_ratio_sl  = gr.Slider(0.0, 0.8, value=0.25, step=0.05, label="Negative sample ratio")
                     max_grad_box  = gr.Number(value=1.0, label="Max grad norm", precision=2)
-                    log_int_sl    = gr.Slider(5, 200, value=10,  step=5, label="Log interval (steps)")
-                    save_int_sl   = gr.Slider(1, 50,  value=5,   step=1, label="Save interval (epochs)")
+                    log_int_sl    = gr.Slider(1, 200, value=10,  step=1, label="Log interval (steps)")
+                    save_int_sl   = gr.Slider(1, 999, value=5,   step=1, label="Save interval (epochs)")
                     num_workers_sl = gr.Slider(
                         0, 8, value=4, step=1,
                         label="DataLoader workers",
@@ -813,6 +950,7 @@ def build_app() -> gr.Blocks:
             cls_w_sl, box_w_sl, giou_w_sl, mask_w_sl, dice_w_sl, pres_w_sl,
             neg_ratio_sl, max_grad_box, log_int_sl, save_int_sl,
             output_dir_box, sam3_path_box, num_workers_sl, num_gpus_sl,
+            max_train_box, max_val_box,
         ]
 
         btn_phase1.click(
@@ -833,6 +971,10 @@ def build_app() -> gr.Blocks:
         )
         btn_h200_p2.click(
             fn=lambda: _preset_outputs("h200_phase2"),
+            outputs=_preset_out_components,
+        )
+        btn_test_8gpu.click(
+            fn=lambda: _preset_outputs("test_8gpu"),
             outputs=_preset_out_components,
         )
 
