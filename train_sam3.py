@@ -531,18 +531,35 @@ class Sam3Dataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img_w, img_h = img.size
 
+        # Augmentation: horizontal flip (preserves normalized box format)
+        flip = self.augment and random.random() < 0.5
+        if flip:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Augmentation: color jitter
+        if self.augment:
+            import torchvision.transforms.functional as TF
+            img = TF.adjust_brightness(img, 1.0 + random.uniform(-0.3, 0.3))
+            img = TF.adjust_contrast(img,   1.0 + random.uniform(-0.3, 0.3))
+            img = TF.adjust_saturation(img, 1.0 + random.uniform(-0.3, 0.3))
+
         # Processor input (normalises + resizes to model input size)
         proc = self.processor(images=img, return_tensors="pt")
         pixel_values = proc["pixel_values"][0]  # (C, H, W)
 
-        # Ground-truth boxes
-        gt_boxes = torch.tensor(s["gt_boxes"], dtype=torch.float32) if s["gt_boxes"] \
+        # Ground-truth boxes — mirror cx on horizontal flip
+        gt_boxes_raw = s["gt_boxes"]
+        if flip and gt_boxes_raw:
+            gt_boxes_raw = [[1.0 - cx, cy, w, h] for cx, cy, w, h in gt_boxes_raw]
+        gt_boxes = torch.tensor(gt_boxes_raw, dtype=torch.float32) if gt_boxes_raw \
                    else torch.zeros((0, 4), dtype=torch.float32)
 
         # Ground-truth masks at low res (mask_size × mask_size)
         gt_masks_list = []
         for seg in s["gt_segs"]:
             m = polygon_to_mask(seg, img_h, img_w)  # (H, W) uint8
+            if flip:
+                m = m[:, ::-1].copy()
             m_t = torch.from_numpy(m).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
             m_lr = F.interpolate(
                 m_t, size=(self.mask_size, self.mask_size),
@@ -975,12 +992,14 @@ def train_one_epoch(
         # Get unique classes in this batch and encode text once per class
         unique_classes = list(dict.fromkeys(class_names))  # preserves order
         text_embed_cache: dict[str, torch.Tensor] = {}
+        _text_no_grad = cfg.freeze_text
         for cls in unique_classes:
             tokens = processor.tokenizer(
                 cls, return_tensors="pt",
                 padding="max_length", max_length=32,
             ).to(device)
-            with torch.no_grad():
+            _ctx = torch.no_grad() if _text_no_grad else torch.enable_grad()
+            with _ctx:
                 embed = raw_model.get_text_features(
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
@@ -1014,13 +1033,9 @@ def train_one_epoch(
                 device,
             )
 
-        # Gradient accumulation
-        # Use no_sync on non-sync steps to skip expensive all_reduce mid-accumulation
+        # Gradient accumulation: skip all_reduce on non-sync steps
         loss = losses["loss_total"] / cfg.accum_steps
         sync_step = (step + 1) % cfg.accum_steps == 0
-        ctx = (model.no_sync() if is_ddp and not sync_step
-               else torch.no_grad.__new__(torch.no_grad))  # null context
-        # Simple approach: just call backward; no_sync avoids redundant comms
         if is_ddp and not sync_step:
             with model.no_sync():
                 if scaler is not None:
@@ -1447,6 +1462,14 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
 
     total_steps = (len(train_loader) // cfg.accum_steps) * cfg.epochs
+    if cfg.warmup_steps >= total_steps:
+        safe_warmup = max(1, int(total_steps * 0.1))
+        logger.warning(
+            f"warmup_steps={cfg.warmup_steps} >= total_steps={total_steps}; "
+            f"clamping to {safe_warmup} (10% of total). "
+            f"Pass --warmup_steps {safe_warmup} to silence this."
+        )
+        cfg.warmup_steps = safe_warmup
 
     def lr_lambda(step: int) -> float:
         if step < cfg.warmup_steps:
