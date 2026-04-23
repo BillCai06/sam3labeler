@@ -406,11 +406,27 @@ def _load_coco_json(ann_path: Path) -> dict:
         return json.load(f)
 
 
+def _ann_passes_filter(ann: dict, min_conf: float, manual_only: bool) -> bool:
+    """Return True if annotation meets quality requirements."""
+    attrs = ann.get("attributes") or {}
+    is_manual = bool(attrs.get("manual"))
+    if manual_only and not is_manual:
+        return False
+    if not is_manual and min_conf > 0.0:
+        conf = attrs.get("detection_confidence")
+        if conf is not None and float(conf) < min_conf:
+            return False
+    return True
+
+
 def _coco_to_samples(
     coco: dict,
     search_dirs: list[Path],
     rng: random.Random,
     neg_ratio: float,
+    min_conf: float = 0.0,
+    manual_only: bool = False,
+    neg_uncertainty_max_conf: float = 0.0,
 ) -> tuple[list[dict], int]:
     """
     Convert a loaded COCO dict to a list of training sample dicts.
@@ -419,16 +435,32 @@ def _coco_to_samples(
     Handles both:
       - Annotations WITH 'bbox' field (run_batch.py output)
       - Annotations WITHOUT 'bbox' field (labeler output — bbox derived from polygon)
+
+    Quality filtering:
+      min_conf:    skip auto prelabels below this detection_confidence (manual
+                   annotations are always kept regardless of their stored conf).
+      manual_only: keep only human-reviewed (attributes.manual=True) annotations.
     """
     id2img = {img["id"]: img for img in coco["images"]}
     id2cat = {cat["id"]: cat["name"] for cat in coco["categories"]}
     all_class_names = [cat["name"] for cat in coco["categories"]]
 
+    # confidence_scores: {filename -> {class -> max_raw_score}}
+    # Saved by BatchProcessor for every image regardless of detection threshold.
+    conf_scores: dict[str, dict[str, float]] = coco.get("confidence_scores") or {}
+
     img2class2anns: dict[int, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    n_filtered = 0
     for ann in coco["annotations"]:
         cls = id2cat.get(ann["category_id"])
-        if cls:
-            img2class2anns[ann["image_id"]][cls].append(ann)
+        if not cls:
+            continue
+        if not _ann_passes_filter(ann, min_conf, manual_only):
+            n_filtered += 1
+            continue
+        img2class2anns[ann["image_id"]][cls].append(ann)
+    if n_filtered:
+        logger.debug(f"  Filtered {n_filtered} low-quality annotations")
 
     samples = []
     missing = 0
@@ -468,19 +500,28 @@ def _coco_to_samples(
                     "is_negative": False,
                 })
 
-        # Negative samples
-        absent = [c for c in all_class_names if c not in classes_present]
-        n_neg = max(1, int(len(classes_present) * neg_ratio / max(1 - neg_ratio, 1e-6)))
-        for cls_name in rng.sample(absent, min(n_neg, len(absent))):
-            samples.append({
-                "image_path": str(img_path),
-                "class_name": cls_name,
-                "gt_boxes": [],
-                "gt_segs": [],
-                "img_w": img_w,
-                "img_h": img_h,
-                "is_negative": True,
-            })
+        # Negative samples — only use images where the class is confidently absent.
+        # If confidence_scores are available and the model scored a class above
+        # neg_uncertainty_max_conf (but below the annotation threshold), that
+        # image is in the "uncertain zone" and must not be used as a negative.
+        if neg_ratio > 0:
+            img_scores = conf_scores.get(filename, {})
+            absent = [
+                c for c in all_class_names
+                if c not in classes_present
+                and float(img_scores.get(c, 0.0)) <= neg_uncertainty_max_conf
+            ]
+            n_neg = max(1, int(len(classes_present) * neg_ratio / max(1 - neg_ratio, 1e-6)))
+            for cls_name in rng.sample(absent, min(n_neg, len(absent))):
+                samples.append({
+                    "image_path": str(img_path),
+                    "class_name": cls_name,
+                    "gt_boxes": [],
+                    "gt_segs": [],
+                    "img_w": img_w,
+                    "img_h": img_h,
+                    "is_negative": True,
+                })
 
     return samples, missing
 
@@ -599,6 +640,9 @@ def build_samples(
     max_samples: Optional[int] = None,
     neg_ratio: float = 0.3,
     seed: int = 42,
+    min_conf: float = 0.0,
+    manual_only: bool = False,
+    neg_uncertainty_max_conf: float = 0.0,
 ) -> list[dict]:
     """
     Build flat list of training samples from COCO annotation sources.
@@ -607,6 +651,11 @@ def build_samples(
       - One positive sample per class present in the image
       - Randomly sampled negative samples for classes absent from the image
         (up to neg_ratio × number of positive samples)
+
+    Quality filtering (applied per annotation before building samples):
+      min_conf:    drop auto-prelabel annotations below this confidence.
+                   Manual annotations (attributes.manual=True) are always kept.
+      manual_only: keep only human-reviewed annotations.
     """
     rng = random.Random(seed)
     all_samples = []
@@ -639,7 +688,9 @@ def build_samples(
                 except Exception as e:
                     logger.warning(f"  Skip {jf.name}: {e}")
                     continue
-                s, m = _coco_to_samples(coco, search_dirs, rng, neg_ratio)
+                s, m = _coco_to_samples(coco, search_dirs, rng, neg_ratio,
+                                        min_conf=min_conf, manual_only=manual_only,
+                                        neg_uncertainty_max_conf=neg_uncertainty_max_conf)
                 source_samples.extend(s)
                 missing_images += m
         else:
@@ -650,7 +701,11 @@ def build_samples(
             except Exception as e:
                 logger.error(f"  Cannot load {source_path}: {e}")
                 continue
-            source_samples, missing_images = _coco_to_samples(coco, search_dirs, rng, neg_ratio)
+            source_samples, missing_images = _coco_to_samples(
+                coco, search_dirs, rng, neg_ratio,
+                min_conf=min_conf, manual_only=manual_only,
+                neg_uncertainty_max_conf=neg_uncertainty_max_conf,
+            )
 
         if missing_images:
             logger.warning(f"  {missing_images} images not found in search dirs")
@@ -1151,41 +1206,75 @@ def validate(
             out, batch["gt_boxes"], batch["gt_masks"], matcher, cfg, device
         )
 
-        # Mask IoU metric on positive samples
+        # Mask IoU metric — confusion-matrix style, matching eval_iou.py exactly.
+        # Merge all queries above score_threshold (handles multi-instance classes).
+        # Per-class IoU = sum(TP) / sum(TP+FP+FN); mIoU = class-mean of that.
         logits = out.pred_logits
         if logits.dim() == 3:
             logits = logits[..., 0]
         scores = logits.sigmoid() * out.presence_logits.sigmoid()
 
+        mask_h, mask_w = out.pred_masks.shape[-2], out.pred_masks.shape[-1]
+        score_threshold = getattr(cfg, "score_threshold", 0.3)
+
         for i in range(len(class_names)):
             gt_m = batch["gt_masks"][i].to(device)
             if gt_m.shape[0] == 0:
                 continue
-            # Best matching query by score
-            top_q = scores[i].argmax().item()
-            pred_mask = (out.pred_masks[i, top_q].sigmoid() > 0.5).float()
 
-            mask_h, mask_w = pred_mask.shape
+            confident = (scores[i] > score_threshold).nonzero(as_tuple=True)[0]
+            if confident.numel() == 0:
+                confident = scores[i].argmax().unsqueeze(0)
+            pred_soft = out.pred_masks[i][confident].sigmoid()         # (K, H, W)
+            pred_mask = (pred_soft.max(dim=0).values > 0.5).float()   # union of instances
+
             gt_r = F.interpolate(
                 gt_m.unsqueeze(1).float(), size=(mask_h, mask_w),
                 mode="nearest",
             ).squeeze(1)
             gt_any = (gt_r.sum(0) > 0).float()
 
-            inter = (pred_mask * gt_any).sum()
-            union = (pred_mask + gt_any).clamp(max=1).sum()
-            iou_scores.append(float(inter / (union + 1e-6)))
+            inter = float((pred_mask * gt_any).sum())
+            union = float((pred_mask + gt_any).clamp(max=1).sum())
+            cls = class_names[i]
+            iou_scores.append((cls, inter, union))
 
         tracker.update({k: float(v) for k, v in losses.items()})
 
-    # Aggregate metrics across all ranks
-    means = _reduce_dict(tracker.means(), device)
-    local_iou = float(np.mean(iou_scores)) if iou_scores else 0.0
-    iou_t = torch.tensor(local_iou, device=device)
+    # Aggregate confusion-matrix accumulators per class, then class-mean mIoU.
+    class_inter: dict = defaultdict(float)
+    class_union: dict = defaultdict(float)
+    for cls, inter, union in iou_scores:
+        class_inter[cls] += inter
+        class_union[cls] += union
+
+    # DDP-correct aggregation: gather raw per-class inter/union from every rank,
+    # merge the pixel counts globally, then compute IoU once from global totals.
+    # Averaging per-rank IoU scalars (mean-of-means) would bias results when
+    # class distribution is uneven across ranks.
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(iou_t, op=dist.ReduceOp.SUM)
-        iou_t /= dist.get_world_size()
-    means["mask_iou"] = float(iou_t)
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, (dict(class_inter), dict(class_union)))
+        merged_inter: dict = defaultdict(float)
+        merged_union: dict = defaultdict(float)
+        for rank_inter, rank_union in gathered:
+            for c, v in rank_inter.items():
+                merged_inter[c] += v
+            for c, v in rank_union.items():
+                merged_union[c] += v
+    else:
+        merged_inter = class_inter
+        merged_union = class_union
+
+    if merged_inter:
+        per_cls_iou = {c: merged_inter[c] / (merged_union[c] + 1e-6) for c in merged_inter}
+        global_iou = sum(per_cls_iou.values()) / len(per_cls_iou)
+    else:
+        global_iou = 0.0
+
+    # Aggregate loss metrics across all ranks
+    means = _reduce_dict(tracker.means(), device)
+    means["mask_iou"] = global_iou
 
     if is_main:
         if writer is not None:
@@ -1275,8 +1364,28 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of data held out for validation.",
     )
     grp.add_argument(
-        "--neg_ratio", type=float, default=0.3,
-        help="Fraction of training samples that are negatives (absent-class).",
+        "--neg_ratio", type=float, default=0.0,
+        help="Fraction of training samples that are negatives (absent-class). "
+             "0.0 = positives only (recommended for segmentation tasks where "
+             "'not annotated' != 'truly absent').",
+    )
+    grp.add_argument(
+        "--min_prelabel_conf", type=float, default=0.0,
+        help="Drop auto-prelabel annotations whose detection_confidence is below this value. "
+             "Manual annotations (attributes.manual=True) are always kept. "
+             "Recommended: 0.5 to filter noisy auto-labels.",
+    )
+    grp.add_argument(
+        "--manual_only", action="store_true",
+        help="Train only on human-reviewed annotations (attributes.manual=True). "
+             "Gives the cleanest signal but uses much less data.",
+    )
+    grp.add_argument(
+        "--neg_uncertainty_max_conf", type=float, default=0.0,
+        help="Max raw score a class may have in an image before that image is excluded "
+             "from negative samples for that class. Requires confidence_scores saved by "
+             "the batch processor (run --rescore if missing). "
+             "Recommended: 0.15  (skip images where model scored 0.15–0.35 as uncertain).",
     )
 
     # --- Model ---
@@ -1317,14 +1426,17 @@ def parse_args() -> argparse.Namespace:
     grp.add_argument("--num_workers", type=int, default=4,
                      help="DataLoader worker processes.")
     grp.add_argument("--seed", type=int, default=42)
+    grp.add_argument("--score_threshold", type=float, default=0.3,
+                     help="Queries above this score are merged into the predicted mask "
+                          "during validation IoU computation (matches eval_iou.py).")
 
     # --- Loss weights ---
     grp = p.add_argument_group("Loss weights")
     grp.add_argument("--cls_loss_weight",      type=float, default=1.0)
-    grp.add_argument("--box_loss_weight",      type=float, default=5.0)
-    grp.add_argument("--giou_loss_weight",     type=float, default=2.0)
-    grp.add_argument("--mask_loss_weight",     type=float, default=2.0)
-    grp.add_argument("--dice_loss_weight",     type=float, default=2.0)
+    grp.add_argument("--box_loss_weight",      type=float, default=1.0)
+    grp.add_argument("--giou_loss_weight",     type=float, default=1.0)
+    grp.add_argument("--mask_loss_weight",     type=float, default=3.0)
+    grp.add_argument("--dice_loss_weight",     type=float, default=3.0)
     grp.add_argument("--presence_loss_weight", type=float, default=1.0)
 
     # --- Logging & checkpoints ---
@@ -1398,15 +1510,49 @@ def main():
         _load_cap = cfg.max_train + cfg.max_val
     elif cfg.max_train:
         _load_cap = int(cfg.max_train / max(1 - cfg.val_split, 0.01))
-    all_samples = build_samples(sources, max_samples=_load_cap, neg_ratio=cfg.neg_ratio, seed=cfg.seed)
+    if cfg.manual_only:
+        logger.info("Data filter: manual annotations only")
+    elif cfg.min_prelabel_conf > 0:
+        logger.info(f"Data filter: auto-labels with conf >= {cfg.min_prelabel_conf} (manual always kept)")
 
-    # Train/val split
-    n_val = cfg.max_val or max(1, int(len(all_samples) * cfg.val_split))
-    n_train = cfg.max_train or (len(all_samples) - n_val)
-    val_samples = all_samples[:n_val]
-    train_samples = all_samples[n_val:n_val + n_train]
+    if cfg.neg_uncertainty_max_conf > 0:
+        logger.info(
+            f"Negative uncertainty filter: skipping images where class scored "
+            f"> {cfg.neg_uncertainty_max_conf} (requires confidence_scores in JSONs)"
+        )
 
-    logger.info(f"Train: {len(train_samples)} | Val: {len(val_samples)}")
+    all_samples = build_samples(
+        sources,
+        max_samples=_load_cap,
+        neg_ratio=cfg.neg_ratio,
+        seed=cfg.seed,
+        min_conf=cfg.min_prelabel_conf,
+        manual_only=cfg.manual_only,
+        neg_uncertainty_max_conf=cfg.neg_uncertainty_max_conf,
+    )
+
+    # Image-level train/val split — all samples from the same image go to the
+    # same split. Sample-level split leaks: the same image's grass/mud/rock
+    # samples can appear in both train and val.
+    rng_split = random.Random(cfg.seed)
+    unique_images = list(dict.fromkeys(s["image_path"] for s in all_samples))
+    rng_split.shuffle(unique_images)
+    n_val_imgs = max(1, int(len(unique_images) * cfg.val_split))
+    val_image_set  = set(unique_images[:n_val_imgs])
+    train_image_set = set(unique_images[n_val_imgs:])
+
+    val_samples   = [s for s in all_samples if s["image_path"] in val_image_set]
+    train_samples = [s for s in all_samples if s["image_path"] in train_image_set]
+
+    if cfg.max_val:
+        val_samples = val_samples[:cfg.max_val]
+    if cfg.max_train:
+        train_samples = train_samples[:cfg.max_train]
+
+    logger.info(
+        f"Train: {len(train_samples)} samples ({len(train_image_set)} images) | "
+        f"Val: {len(val_samples)} samples ({len(val_image_set)} images)"
+    )
 
     # ── Model ─────────────────────────────────────────────
     sam3_path = cfg.sam3_path
@@ -1545,15 +1691,17 @@ def main():
         val_loss = val_metrics.get("loss_total", float("inf"))
         val_iou  = val_metrics.get("mask_iou", 0.0)
 
-        # Best-model checkpoint (rank 0 only)
-        if is_main and val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Best-model checkpoint (rank 0 only) — mask_iou as criterion.
+        # With an image-level split and confusion-matrix IoU that matches
+        # eval_iou.py, the val IoU is now a clean signal aligned with the
+        # final benchmark metric we care about.
+        if is_main and val_iou > best_val_iou:
+            best_val_iou  = val_iou
+            best_val_loss = min(best_val_loss, val_loss)
             save_checkpoint(model, processor, optimizer, scheduler, epoch,
                             val_metrics, out_dir / "best")
-            logger.info(f"  ★ New best model (val_loss={best_val_loss:.4f}, "
-                        f"mask_iou={val_iou:.4f})")
-
-        # Periodic checkpoint
+            logger.info(f"  ★ New best model (mask_iou={best_val_iou:.4f}, "
+                        f"val_loss={val_loss:.4f}")
         if is_main and epoch % cfg.save_interval == 0:
             save_checkpoint(model, processor, optimizer, scheduler, epoch,
                             val_metrics, out_dir / f"epoch_{epoch:04d}")
@@ -1567,7 +1715,7 @@ def main():
             tb_writer.close()
 
         logger.info("=" * 60)
-        logger.info(f"Training complete. Best val_loss={best_val_loss:.4f}")
+        logger.info(f"Training complete. Best mask_iou={best_val_iou:.4f}  val_loss={best_val_loss:.4f}")
         logger.info(f"Best model → {out_dir / 'best'}")
         logger.info(f"Loss log   → {out_dir / 'losses.csv'}")
         logger.info("=" * 60)

@@ -102,7 +102,9 @@ class Sam3ImageDetector:
         images: list[Image.Image],
         classes: list[str],
         confidence_threshold: float = 0.25,
-    ) -> list[list[dict]]:
+        return_raw_scores: bool = False,
+        scores_only: bool = False,
+    ) -> "list[list[dict]] | tuple[list[list[dict]], list[dict[str, float]]]":
         """
         Process N images simultaneously.
 
@@ -110,10 +112,17 @@ class Sam3ImageDetector:
             images: list of PIL RGB images (can be different sizes).
             classes: class names to detect.
             confidence_threshold: keep detections at or above this score.
+            return_raw_scores: also return per-class max scores (pre-threshold).
+            scores_only: skip mask/bbox extraction entirely — only compute raw
+                         per-class max scores. Implies return_raw_scores=True.
+                         Use this for confidence-score backfilling (rescore tool).
 
         Returns:
             list of length N; each element is the result list for that image.
+            If return_raw_scores or scores_only: returns (results, raw_scores).
         """
+        if scores_only:
+            return_raw_scores = True
         if self.model is None:
             self.load()
 
@@ -132,10 +141,10 @@ class Sam3ImageDetector:
         self._cache_text_embeds(classes)
 
         batch_results: list[list[dict]] = [[] for _ in range(N)]
+        # raw_scores[i][cls] = max query score for that class in image i (pre-threshold)
+        raw_scores: list[dict[str, float]] = [{} for _ in range(N)]
 
         for cls in classes:
-            # text_embeds shape (1, hidden_dim) — model auto-broadcasts to batch N
-            # text_embeds cached as (1, hidden_dim); expand to match image batch
             text_embeds = self._text_embed_cache[cls].expand(N, -1, -1)
 
             with torch.inference_mode():
@@ -148,12 +157,17 @@ class Sam3ImageDetector:
             # presence_logits: (N, 1)
             logits = out.pred_logits.sigmoid()
             if logits.dim() == 3:
-                logits = logits[..., 0]                     # (N, num_queries)
-            scores = logits * out.presence_logits.sigmoid() # (N, num_queries)
+                logits = logits[..., 0]                      # (N, num_queries)
+            scores = logits * out.presence_logits.sigmoid()  # (N, num_queries)
 
             for i in range(N):
                 H, W = sizes[i]
-                img_scores = scores[i]                      # (num_queries,)
+                img_scores = scores[i]                       # (num_queries,)
+                raw_scores[i][cls] = float(img_scores.max())
+
+                if scores_only:
+                    continue  # skip mask/bbox — caller only needs raw scores
+
                 above = (img_scores >= confidence_threshold).nonzero(as_tuple=False).view(-1)
                 for qi in above.tolist():
                     score = float(img_scores[qi])
@@ -167,8 +181,11 @@ class Sam3ImageDetector:
                         "sam_score": score,
                     })
 
-        total = sum(len(r) for r in batch_results)
-        logger.info(f"Sam3ImageDetector batch={N}: {total} detections above threshold")
+        if not scores_only:
+            total = sum(len(r) for r in batch_results)
+            logger.info(f"Sam3ImageDetector batch={N}: {total} detections above threshold")
+        if return_raw_scores:
+            return batch_results, raw_scores
         return batch_results
 
     # ------------------------------------------------------------------

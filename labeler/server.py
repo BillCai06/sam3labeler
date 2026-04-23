@@ -95,10 +95,15 @@ async def api_datasets(base: str = "outputs"):
         base_path = Path.cwd() / base_path
 
     results = []
+    seen: set[str] = set()
     if base_path.exists():
-        for d in sorted(base_path.iterdir()):
-            if d.is_dir() and (d / "annotations").is_dir():
-                results.append({"path": str(d.resolve()), "name": d.name})
+        for ann_dir in sorted(base_path.rglob("annotations")):
+            if ann_dir.is_dir():
+                d = ann_dir.parent
+                key = str(d.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"path": key, "name": d.name})
     return {"datasets": results}
 
 

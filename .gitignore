@@ -12,6 +12,7 @@ sam3/
 
 # Output files
 outputs/
+OLDDATA/
 
 # Test images
 *.jpg

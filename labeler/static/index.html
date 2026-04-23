@@ -1412,6 +1412,10 @@ async function initDatasets() {
       o.value = ds.path; o.textContent = ds.name;
       sel.appendChild(o);
     }
+    if (d.datasets && d.datasets.length > 0) {
+      sel.value = d.datasets[0].path;
+      await loadDataset();
+    }
   } catch {}
 }
 

@@ -253,9 +253,10 @@ class BatchProcessor:
             progress_callback(processed_so_far, total, f"Processing {label}")
 
         try:
-            batch_results = self.pipeline.detector.detect_and_segment_batch(
+            batch_results, raw_scores = self.pipeline.detector.detect_and_segment_batch(
                 images, active_classes,
                 confidence_threshold=self.pipeline.confidence_threshold,
+                return_raw_scores=True,
             )
         except Exception as e:
             logger.error(f"Batch inference failed: {traceback.format_exc()}")
@@ -285,7 +286,17 @@ class BatchProcessor:
                 if save_coco:
                     per_writer = COCOWriter(active_classes)
                     per_writer.add_image_results(rel_key, results, img_w, img_h)
-                    per_writer.save(json_dir / f"{flat_stem}.json")
+                    coco_dict = per_writer.to_dict()
+                    # Store raw per-class max scores so training can build
+                    # conservative negative samples (uncertain zone filtering).
+                    coco_dict["confidence_scores"] = {
+                        rel_key: {
+                            cls: round(raw_scores[idx].get(cls, 0.0), 4)
+                            for cls in active_classes
+                        }
+                    }
+                    out_json = json_dir / f"{flat_stem}.json"
+                    out_json.write_text(json.dumps(coco_dict, indent=2))
 
                 if save_viz and results:
                     viz_img = visualize_results(image, results, active_classes, alpha=viz_alpha)

@@ -80,8 +80,24 @@ def main():
         "--labeler", action="store_true",
         help="Launch manual labeling WebUI",
     )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="Launch model comparison GUI (side-by-side two checkpoints)",
+    )
 
     args = parser.parse_args()
+
+    # Compare mode
+    if args.compare:
+        from gui.compare import build_compare_app
+        port = args.port or 7861
+        print(f"\n{'='*50}")
+        print(f"  Model Comparison  →  http://localhost:{port}")
+        print(f"{'='*50}\n")
+        demo = build_compare_app(config_path=args.config)
+        demo.launch(server_name="0.0.0.0", server_port=port,
+                    allowed_paths=["/mnt/usbssd", "/tmp"])
+        return
 
     # Labeler mode
     if args.labeler:
