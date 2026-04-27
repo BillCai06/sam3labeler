@@ -42,7 +42,7 @@ HUSKY_IMGS = OUTPUTS / "husky_frames"
 CHECKPOINTS = [
     ("Base SAM3",       str(BASE_DIR / "sam3")),
     ("Phase1 h200",     str(BASE_DIR / "checkpoints/phase1_prompt_mask_v3/best")),
-    # ("Phase2 ft3",      str(BASE_DIR / "checkpoints/phase2_h200_ft3/best")),
+    ("Phase2 h200",      str(BASE_DIR / "checkpoints/phase2_prompt_mask_v3c_continue/best")),
     # ("Phase2 ft5",      str(BASE_DIR / "checkpoints/phase2_h200_ft5/best")),
 ]
 
