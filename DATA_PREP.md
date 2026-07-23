@@ -1,177 +1,177 @@
-# 数据准备指南
+# Data Preparation Guide
 
-本文档涵盖从原始图片到可用于 SAM3 fine-tuning 的完整数据准备流程。
+This document covers the full data preparation workflow, from raw images to a dataset ready for SAM3 fine-tuning.
 
 ---
 
-## 全流程总览
+## Pipeline overview
 
 ```
-原始图片
+Raw images
    │
    ▼
-Step 1: 批量自动标注 (run_batch.py)
+Step 1: Batch auto-labeling (run_batch.py)
    │  → outputs/<run_dir>/annotations/<image>.json
    │
    ▼
-Step 2: 人工清洗 (Labeler WebUI)
-   │  → 删错误标注 / 改类别 / 补漏标 / 合并重叠
+Step 2: Manual cleanup (Labeler WebUI)
+   │  → delete wrong annotations / fix classes / add missing labels / merge overlaps
    │
    ▼
-Step 3: 数据验证 (validate_dataset.py)
-   │  → 确认无格式错误，查看类别分布
+Step 3: Dataset validation (validate_dataset.py)
+   │  → confirm no format errors, inspect class distribution
    │
    ▼
-Step 4: 训练 (train_gui.py 或 train_sam3.py)
+Step 4: Training (train_gui.py or train_sam3.py)
 ```
 
 ---
 
-## Step 1：批量自动标注
+## Step 1: Batch auto-labeling
 
-用当前 SAM3 模型对图片做初始推理，生成待清洗的标注。
+Run the current SAM3 model over the images to generate a first pass of annotations for manual cleanup.
 
 ```bash
-# 基本用法（图片在 /path/to/images/，类别在 config.yaml 里）
+# Basic usage (images in /path/to/images/, classes from config.yaml)
 conda run -n qwen3vl2sam python3 run_batch.py \
     --input /path/to/images/ \
     --auto \
     --config config.yaml
 
-# 指定类别
+# Specify classes explicitly
 conda run -n qwen3vl2sam python3 run_batch.py \
     --input /path/to/images/ \
     --classes rock tree grass car person
 
-# 调整置信度阈值（降低 = 更多候选，留给人工清洗；提高 = 更干净但可能漏检）
+# Adjust confidence thresholds (lower = more candidates for manual review; higher = cleaner but may miss detections)
 conda run -n qwen3vl2sam python3 run_batch.py \
     --input /path/to/images/ \
     --auto --confidence 0.30 --sam-score 0.30
 ```
 
-**输出目录结构：**
+**Output directory structure:**
 ```
 outputs/
 └── run_20260415_143000/
     ├── annotations/
-    │   ├── frame_000000.json   ← 每张图一个 JSON（和图片同名）
+    │   ├── frame_000000.json   ← one JSON per image (same name as image)
     │   ├── frame_000001.json
     │   └── ...
-    ├── annotations.json        ← 全局合并版（可选用）
-    ├── visualizations/         ← 可视化图（便于快速检查）
+    ├── annotations.json        ← merged global version (optional to use)
+    ├── visualizations/         ← visualization images (for quick review)
     └── summary.json
 ```
 
-**建议参数：**
+**Suggested parameters:**
 
-| 场景 | confidence | sam-score | 效果 |
-|------|-----------|-----------|------|
-| 追求覆盖率（后期多删） | 0.25 | 0.25 | 候选多，需要大量清洗 |
-| 平衡（推荐起点） | 0.35 | 0.35 | 默认值 |
-| 追求精度（可能漏检） | 0.50 | 0.50 | 较干净，需补漏 |
+| Goal | confidence | sam-score | Effect |
+|------|-----------|-----------|--------|
+| Maximize coverage (more deletion later) | 0.25 | 0.25 | More candidates, heavier cleanup needed |
+| Balanced (recommended starting point) | 0.35 | 0.35 | Default values |
+| Maximize precision (may miss detections) | 0.50 | 0.50 | Cleaner, but may need to add missing labels |
 
 ---
 
-## Step 2：人工标注清洗（Labeler WebUI）
+## Step 2: Manual annotation cleanup (Labeler WebUI)
 
 ```bash
 conda run -n qwen3vl2sam python3 run_batch.py \
     --labeler \
     --config config.yaml
-# → 浏览器打开 http://localhost:7777
+# → opens http://localhost:7777 in your browser
 ```
 
-### 界面操作
+### Interface operations
 
-#### 浏览标注
+#### Browsing annotations
 
-- 左侧列表选择数据集和图片
-- 当前图片的所有标注以彩色 mask 显示
-- 点击 mask 可选中并高亮
+- Select a dataset and image from the list on the left
+- All annotations for the current image are shown as colored masks
+- Click a mask to select and highlight it
 
-#### 删除错误标注
+#### Deleting wrong annotations
 
-- **单击** mask → 选中（高亮边框）
-- 按 `Delete` 键 → 删除选中标注
-- 也可在右侧列表点击删除按钮
+- **Click** a mask → select it (highlighted outline)
+- Press `Delete` → remove the selected annotation
+- You can also click the delete button in the right-hand list
 
-#### 修改类别
+#### Fixing classes
 
-- 选中标注 → 右侧下拉菜单选新类别 → 保存
+- Select an annotation → pick a new class from the dropdown on the right → save
 
-#### 补充漏标（两种方式）
+#### Adding missing labels (two methods)
 
-**方式 A：画框 + SAM 自动分割**
-1. 在工具栏选"Draw Box"模式
-2. 在图片上框出目标区域
-3. 选择类别，点击"SAM"按钮 → 自动生成 mask
+**Method A: Draw box + auto-segment with SAM**
+1. Select "Draw Box" mode in the toolbar
+2. Draw a box around the target region
+3. Pick a class and click "SAM" → the mask is generated automatically
 
-**方式 B：点击 + SAM 自动分割**
-1. 选"Point"模式
-2. 点击目标中心
-3. SAM 自动识别点所在的对象
+**Method B: Click + auto-segment with SAM**
+1. Select "Point" mode
+2. Click the center of the target
+3. SAM automatically segments the object under the point
 
-#### 合并同类重叠标注
+#### Merging overlapping annotations of the same class
 
-- 选中多个同类 mask（Ctrl+Click 或框选）
-- 点击"Merge Class"→ 用 Shapely 做 union 合并成一个多边形
+- Select multiple masks of the same class (Ctrl+Click or box-select)
+- Click "Merge Class" → performs a Shapely union to merge them into a single polygon
 
-#### 跨帧传播
+#### Propagating across frames
 
-- 选中当前帧的标注
-- 点击"Propagate →"→ 将当前帧的 bbox 作为 prompt 在下一帧重新推理
+- Select an annotation in the current frame
+- Click "Propagate →" → the current frame's bbox is used as a prompt to re-infer on the next frame
 
-#### 保存
+#### Saving
 
-- 每次改动后点"Save"（快捷键 `Ctrl+S`）
-- 保存到 `annotations/<image_name>.json`，**原子写入**（先写 .tmp 再 rename）
+- Click "Save" after every change (shortcut `Ctrl+S`)
+- Saved to `annotations/<image_name>.json`, written **atomically** (writes to a `.tmp` file first, then renames)
 
-### 清洗策略
+### Cleanup strategy
 
-**优先级从高到低：**
+**Priority order, highest first:**
 
-1. **删除置信度极低的错误检测**（FP）
-   - 明显不是目标类别的 mask
-   - 破碎的小碎片（area < 100 pixels）
+1. **Delete low-confidence false detections**
+   - Masks that are clearly the wrong class
+   - Small fragmented pieces (area < 100 pixels)
 
-2. **修正类别标签**
-   - "tree" 误标为 "branch" 等近似类别
-   - 运行了 `_CLASS_ALIASES`（tree → trees）的自动替换后检查
+2. **Fix class labels**
+   - E.g. "tree" mislabeled as "branch" or similar near-duplicate classes
+   - Double-check after the automatic `_CLASS_ALIASES` substitution runs (tree → trees)
 
-3. **合并同类重叠**
-   - 同一个物体被检测到多次
-   - 使用"Merge Class"功能
+3. **Merge same-class overlaps**
+   - The same object detected multiple times
+   - Use the "Merge Class" feature
 
-4. **补漏**
-   - 明显漏掉的目标用"Draw Box"补上
+4. **Add missing labels**
+   - Add clearly missed targets using "Draw Box"
 
-5. **跨帧一致性**
-   - 用"Propagate"快速补全序列帧
+5. **Cross-frame consistency**
+   - Use "Propagate" to quickly fill in sequential frames
 
-### 每类最低清洗目标
+### Minimum cleanup targets per class
 
-| 类别重要性 | 目标标注数 | 清洗时间估计 |
+| Class importance | Target annotation count | Estimated review effort |
 |-----------|-----------|------------|
-| 核心类别 | ≥ 200 条 | 重点检查每条 |
-| 普通类别 | ≥ 50 条 | 抽查 20% |
-| 稀有类别 | ≥ 20 条（低于此值效果差） | 全检 |
+| Core classes | ≥ 200 | Review every annotation |
+| Common classes | ≥ 50 | Spot-check 20% |
+| Rare classes | ≥ 20 (below this, results suffer) | Review all |
 
 ---
 
-## Step 3：数据验证
+## Step 3: Dataset validation
 
 ```bash
 conda run -n qwen3vl2sam python3 validate_dataset.py \
     outputs/your_run/annotations \
     /path/to/images/
 
-# 如果是全局 annotations.json 格式：
+# For the merged global annotations.json format:
 conda run -n qwen3vl2sam python3 validate_dataset.py \
     outputs/your_run/annotations.json \
     /path/to/images/
 ```
 
-**正常输出示例：**
+**Example of normal output:**
 ```
 ── Categories ──────────────────────────────────
   id=  8  rock         28769 annotations
@@ -183,37 +183,37 @@ conda run -n qwen3vl2sam python3 validate_dataset.py \
   ✓ No blocking errors. Dataset can be used.
 ```
 
-**常见错误和修复：**
+**Common errors and fixes:**
 
-| 错误信息 | 原因 | 修复方法 |
+| Error message | Cause | Fix |
 |---------|------|---------|
-| `category_id=26 not in categories` | 标注了未定义的类 | 在 config.yaml 补上该类，或在 Labeler 改类别 |
-| `Image file not found` | 图片路径不对 | 确认图片和 annotations/ 在同一目录 |
-| `RLE segmentation not supported` | 用了 RLE 格式 | 需转换为 polygon 格式 |
-| `bbox w<=0 or h<=0` | 无效 bbox | 删除该标注或重新画框 |
-| `Duplicate annotation IDs` | ID 冲突（merge 工具问题） | 通常无影响，training 按 JSON 重建 ID |
+| `category_id=26 not in categories` | An annotation references an undefined class | Add the class to config.yaml, or fix it in the Labeler |
+| `Image file not found` | Wrong image path | Confirm images and `annotations/` live in the same directory |
+| `RLE segmentation not supported` | Segmentation uses RLE format | Convert to polygon format |
+| `bbox w<=0 or h<=0` | Invalid bbox | Delete the annotation or redraw the box |
+| `Duplicate annotation IDs` | ID collision (merge tool issue) | Usually harmless — training rebuilds IDs from the JSON |
 
-**警告处理建议：**
+**Warning handling guide:**
 
-| 警告 | 严重程度 | 建议 |
+| Warning | Severity | Recommendation |
 |-----|---------|------|
-| 类别只有 1-9 条标注 | ⚠ 高 | 补充数据或从训练中排除该类 |
-| 类别有 10-50 条标注 | ⚠ 中 | 尽量增加，效果会受影响 |
-| 某类 0 条标注 | ℹ 低 | 作为纯负样本类仍有用（让模型学会"这里没有"） |
+| Class has only 1–9 annotations | ⚠ High | Add more data or exclude the class from training |
+| Class has 10–50 annotations | ⚠ Medium | Add more if possible — results will be affected |
+| Class has 0 annotations | ℹ Low | Still useful as a pure negative class (teaches the model "not here") |
 
 ---
 
-## Step 4：开始训练
+## Step 4: Start training
 
-验证通过后，直接训练：
+Once validation passes, start training directly:
 
 ```bash
-# WebUI 方式（推荐）
+# WebUI method (recommended)
 conda run -n qwen3vl2sam python3 train_gui.py --port 7861
-# → 浏览器打开 http://localhost:7861
-# → 点击 "Phase 1 — Head Only" 预设 → Start Training
+# → open http://localhost:7861 in your browser
+# → click the "Phase 1 — Head Only" preset → Start Training
 
-# CLI 方式（1600张图推荐参数）
+# CLI method (recommended parameters for ~1600 images)
 conda run -n qwen3vl2sam python3 train_sam3.py \
     --outputs_dir outputs \
     --freeze_vision --freeze_text \
@@ -224,22 +224,22 @@ conda run -n qwen3vl2sam python3 train_sam3.py \
 
 ---
 
-## 数据格式详细规范
+## Detailed data format specification
 
-### 目录结构（Per-image JSON 格式，推荐）
+### Directory layout (per-image JSON format, recommended)
 
 ```
 dataset_root/
-├── frame_000000.jpg        ← 图片文件
+├── frame_000000.jpg        ← image file
 ├── frame_000001.jpg
 ├── ...
-└── annotations/            ← 必须命名为 "annotations"
-    ├── frame_000000.json   ← 文件名必须和图片同名（.json 替换 .jpg/.png）
+└── annotations/            ← must be named "annotations"
+    ├── frame_000000.json   ← filename must match the image (.json instead of .jpg/.png)
     ├── frame_000001.json
     └── ...
 ```
 
-### 每个 JSON 文件格式
+### Per-image JSON format
 
 ```json
 {
@@ -276,36 +276,36 @@ dataset_root/
 }
 ```
 
-### 字段约束
+### Field constraints
 
 #### `categories`
 
 ```
-id           整数，从 1 开始，连续或不连续均可
-name         字符串，和 config.yaml 里的 classes 列表一致
-supercategory  字符串，统一写 "object" 即可
+id             integer, starting from 1; consecutive or not, either is fine
+name           string, must match a name in the `classes` list in config.yaml
+supercategory  string, use "object" for all entries
 ```
 
-> 所有 JSON 文件里的 categories 列表必须相同（id 和 name 的对应关系一致）
+> The `categories` list must be identical across all JSON files (same id ↔ name mapping)
 
 #### `images`
 
 ```
-id           整数，per-image 格式固定为 1
-file_name    仅文件名，不含路径，例如 "frame_000000.jpg"
-width/height 像素尺寸，必须和实际图片匹配
+id            integer; always 1 in the per-image format
+file_name     filename only, no path, e.g. "frame_000000.jpg"
+width/height  pixel dimensions, must match the actual image
 ```
 
 #### `annotations`
 
 ```
-id           整数，在本文件内唯一（从 1 开始即可）
-image_id     等于上面 images[0].id，per-image 格式固定为 1
-category_id  必须在本文件的 categories 中有对应 id
-iscrowd      固定为 0
+id           integer, unique within this file (starting from 1 is fine)
+image_id     equal to images[0].id above; always 1 in the per-image format
+category_id  must correspond to an id present in this file's categories
+iscrowd      always 0
 ```
 
-#### `segmentation`（polygon 格式）
+#### `segmentation` (polygon format)
 
 ```json
 "segmentation": [
@@ -313,51 +313,51 @@ iscrowd      固定为 0
 ]
 ```
 
-- 外层是多边形列表（一般只有 1 个，复杂形状可以多个）
-- 内层是顺序顶点坐标，**坐标单位是像素**
-- 每个多边形**至少 3 个点（6 个数）**
-- 坐标范围：`0 ≤ x < width`，`0 ≤ y < height`
+- Outer list is the list of polygons (usually just 1; complex shapes can have more)
+- Inner list is the ordered vertex coordinates, **in pixel units**
+- Each polygon needs **at least 3 points (6 numbers)**
+- Coordinate range: `0 ≤ x < width`, `0 ≤ y < height`
 
-#### `bbox`（可选）
+#### `bbox` (optional)
 
 ```json
 "bbox": [x, y, width, height]
 ```
 
-- COCO 标准：左上角 `(x, y)` + 宽高（像素）
-- **Labeler 输出可以不包含此字段** — 训练脚本自动从 polygon 计算
-- `width > 0`，`height > 0`
+- COCO standard: top-left corner `(x, y)` + width/height (pixels)
+- **The Labeler's output can omit this field** — the training script computes it from the polygon automatically
+- `width > 0`, `height > 0`
 
 ---
 
-## 数据量参考
+## Data volume reference
 
-| 数据规模 | 效果预期 | 推荐策略 |
+| Dataset size | Expected outcome | Recommended strategy |
 |---------|---------|---------|
-| < 200 张 | 基本无法训练 | 扩充数据 |
-| 200–500 张 | 有限改善 | freeze_vision + freeze_text，只训练头部 |
-| 500–2000 张 | 明显改善 | freeze_vision + freeze_text，Phase 1 |
-| 2000–5000 张 | 良好效果 | finetune_ratio=0.01，Phase 1+2 |
-| > 5000 张 | 接近全量训练 | finetune_ratio=0.05，全量 fine-tune |
+| < 200 images | Not really trainable | Collect more data |
+| 200–500 images | Limited improvement | freeze_vision + freeze_text, head-only training |
+| 500–2000 images | Noticeable improvement | freeze_vision + freeze_text, Phase 1 |
+| 2000–5000 images | Good results | finetune_ratio=0.01, Phase 1+2 |
+| > 5000 images | Close to full fine-tuning | finetune_ratio=0.05, full fine-tune |
 
-每个类别建议标注数：
+Recommended annotation counts per class:
 
-| 类型 | 最低 | 推荐 | 优秀 |
+| Class type | Minimum | Recommended | Good |
 |-----|-----|-----|-----|
-| 主要类别（rock, car...）| 50 | 200 | 500+ |
-| 次要类别 | 20 | 80 | 200 |
-| 稀有类别 | 10 | 40 | 100 |
+| Primary classes (rock, car...) | 50 | 200 | 500+ |
+| Secondary classes | 20 | 80 | 200 |
+| Rare classes | 10 | 40 | 100 |
 
 ---
 
-## 快速检查清单
+## Quick checklist
 
-训练前确认：
+Confirm before training:
 
-- [ ] `validate_dataset.py` 运行无 ERROR
-- [ ] 所有图片文件存在于磁盘
-- [ ] 核心类别标注数 ≥ 50
-- [ ] `categories` 里的 `name` 和 `config.yaml` 的 `classes` 一致
-- [ ] 每张图片至少有 1 条标注（纯空图可以有，但不应超过 30%）
-- [ ] segmentation polygon 顶点数 ≥ 3（6 个坐标值）
-- [ ] `image.width` / `image.height` 和实际图片尺寸一致
+- [ ] `validate_dataset.py` runs with no ERROR
+- [ ] All image files exist on disk
+- [ ] Core classes have ≥ 50 annotations
+- [ ] `name` values in `categories` match the `classes` list in `config.yaml`
+- [ ] Every image has at least 1 annotation (fully empty images are allowed, but should be under 30% of the set)
+- [ ] Segmentation polygons have ≥ 3 vertices (6 coordinate values)
+- [ ] `image.width` / `image.height` match the actual image dimensions

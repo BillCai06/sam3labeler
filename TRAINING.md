@@ -1,50 +1,50 @@
-# SAM3 Fine-tuning 训练说明
+# SAM3 Fine-tuning Notes
 
-## 环境
+## Environment
 
-- 硬件：8× NVIDIA H200 (140 GB each)
-- Conda 环境：`qwen3vl2sam`
-- Python：3.11
-- 训练脚本：`train_sam3.py`
-
----
-
-## 数据
-
-- 数据目录：`outputs/20260320_125939_dataset/`
-- 格式：COCO JSON，包含 drone 和 husky 两类图像
-- 图像来源：`drone_frames/`、`husky_frames/`
-- 自动标注 + 人工审核混合；使用 `--min_prelabel_conf 0.5` 过滤低置信度自动标注
-- 训练/验证比：85% / 15%（`--val_split 0.15`）
-- 负样本比例：25%（`--neg_ratio 0.25`）
+- Hardware: 8× NVIDIA H200 (140 GB each)
+- Conda environment: `qwen3vl2sam`
+- Python: 3.11
+- Training script: `train_sam3.py`
 
 ---
 
-## 训练策略：两阶段
+## Data
 
-SAM3 的 fine-tuning 分两个阶段，原因是直接解冻整个模型容易破坏预训练特征。
+- Data directory: `outputs/20260320_125939_dataset/`
+- Format: COCO JSON, covering drone and husky image classes
+- Image sources: `drone_frames/`, `husky_frames/`
+- Mix of auto-labeled and manually reviewed annotations; low-confidence auto-labels filtered with `--min_prelabel_conf 0.5`
+- Train/val split: 85% / 15% (`--val_split 0.15`)
+- Negative sample ratio: 25% (`--neg_ratio 0.25`)
 
-### Phase 1 — Head Only（冻结 Backbone）
+---
 
-只训练检测头（decoder），vision encoder 和 text encoder 全部冻结。
+## Training strategy: two phases
 
-**目标：** 让 head 快速适应新数据分布，风险低，不会破坏预训练特征。
+SAM3 fine-tuning is split into two phases, because unfreezing the whole model at once tends to destroy the pretrained features.
 
-**关键参数：**
+### Phase 1 — Head Only (frozen backbone)
 
-| 参数 | 值 | 说明 |
+Only the detection head (decoder) is trained; the vision encoder and text encoder are both fully frozen.
+
+**Goal:** let the head quickly adapt to the new data distribution with low risk, without damaging the pretrained features.
+
+**Key parameters:**
+
+| Parameter | Value | Notes |
 |------|-----|------|
-| `--freeze_vision` | ✓ | 冻结视觉编码器 |
-| `--freeze_text` | ✓ | 冻结文本编码器 |
-| `--finetune_ratio` | `0.0` | backbone 完全冻结 |
-| `--lr` | `6e-4` | head 学习率 |
-| `--batch_size` | `64` | 单 GPU，冻结 backbone 显存充足 |
-| `--accum_steps` | `1` | effective batch = 64 |
-| `--epochs` | `40` | head-only 收敛需要较多 epoch |
-| `--warmup_steps` | `300` | 线性 warmup |
+| `--freeze_vision` | ✓ | Freeze the vision encoder |
+| `--freeze_text` | ✓ | Freeze the text encoder |
+| `--finetune_ratio` | `0.0` | Backbone fully frozen |
+| `--lr` | `6e-4` | Head learning rate |
+| `--batch_size` | `64` | Single GPU — frozen backbone leaves plenty of VRAM headroom |
+| `--accum_steps` | `1` | Effective batch = 64 |
+| `--epochs` | `40` | Head-only convergence needs more epochs |
+| `--warmup_steps` | `300` | Linear warmup |
 | `--weight_decay` | `0.05` | |
 
-**运行命令（单 GPU）：**
+**Run command (single GPU):**
 
 ```bash
 python train_sam3.py \
@@ -66,7 +66,7 @@ python train_sam3.py \
   --dice_loss_weight 3.0
 ```
 
-**实际结果（各次实验）：**
+**Actual results (across runs):**
 
 | Run | Epochs | LR | Best val_loss | Best mask_IoU |
 |-----|--------|----|--------------|--------------|
@@ -74,40 +74,40 @@ python train_sam3.py \
 | `phase1_h200_lr6e4` | 40/40 | 6e-4 | 3.122 | 0.392 |
 | `phase1_h200_v2` | 22/40 | 3e-4 | 3.051 | 0.404 |
 
-> **最佳 Phase 1 checkpoint：`checkpoints/phase1_h200/best`**
+> **Best Phase 1 checkpoint: `checkpoints/phase1_h200/best`**
 
-**观察：**
-- val loss 稳定下降（3.48 → 3.12），无明显过拟合
-- mask_iou 在 head-only 阶段有明显噪声（±0.1），不适合直接用 IoU 选模型
-- dice_loss 持续下降（0.43 → 0.34），soft mask 质量在改善，但 hard IoU（阈值 0.5）未必同步
-- **选模型标准：val_loss**（IoU 噪声太大，val set 小时容易被单 epoch 峰值锁死）
+**Observations:**
+- val loss decreases steadily (3.48 → 3.12) with no clear overfitting
+- mask_iou is noticeably noisy in the head-only phase (±0.1), so it's not reliable for model selection on its own
+- dice_loss keeps decreasing (0.43 → 0.34) — soft mask quality keeps improving, but that doesn't always track hard IoU (threshold 0.5) in lockstep
+- **Model selection criterion: val_loss** (IoU is too noisy — with a small val set it can get locked to a single-epoch spike)
 
 ---
 
-### Phase 2 — Light Backbone Fine-tune（轻度解冻 Vision）
+### Phase 2 — Light Backbone Fine-tune (light vision unfreeze)
 
-从 Phase 1 最佳 checkpoint 加载模型权重，解冻 vision encoder，用极低 LR 微调。text encoder 保持冻结。
+Loads weights from the best Phase 1 checkpoint, unfreezes the vision encoder, and fine-tunes it with a very low LR. The text encoder stays frozen.
 
-**目标：** 让 vision encoder 适应新数据的视觉特征，突破 head-only 的 IoU 上限。
+**Goal:** let the vision encoder adapt to the visual characteristics of the new data, pushing past the head-only IoU ceiling.
 
-**关键参数：**
+**Key parameters:**
 
-| 参数 | 值 | 说明 |
+| Parameter | Value | Notes |
 |------|-----|------|
-| `--freeze_text` | ✓ | text encoder 继续冻结 |
-| `--freeze_vision` | ✗ | vision encoder 解冻 |
-| `--finetune_ratio` | `0.05` | backbone LR = 5% of head LR |
-| `--lr` | `2e-4` | head LR；backbone LR = 1e-5 |
-| `--batch_size` | `4` | backbone 有梯度，显存需求大幅增加 |
-| `--accum_steps` | `8` | effective batch = 4×8×4GPU = 128 |
-| `--epochs` | `20` | backbone 收敛快 |
-| `--warmup_steps` | `30` | 从已训练权重继续，warmup 短 |
+| `--freeze_text` | ✓ | Text encoder stays frozen |
+| `--freeze_vision` | ✗ | Vision encoder unfrozen |
+| `--finetune_ratio` | `0.05` | Backbone LR = 5% of head LR |
+| `--lr` | `2e-4` | Head LR; backbone LR = 1e-5 |
+| `--batch_size` | `4` | Backbone now has gradients, so VRAM usage jumps a lot |
+| `--accum_steps` | `8` | Effective batch = 4×8×4 GPUs = 128 |
+| `--epochs` | `20` | Backbone converges faster |
+| `--warmup_steps` | `30` | Continuing from trained weights, so warmup is short |
 
-> **注意：** Phase 2 不能用 `--resume`，必须用 `--sam3_path`。  
-> 原因：`--resume` 会加载 Phase 1 的 optimizer 状态（仅 1 个 param group），而 Phase 2 解冻 backbone 后有 2 个 param group，加载会报 mismatch 错误。  
-> 用 `--sam3_path` 加载模型权重，optimizer 重新初始化。
+> **Note:** Phase 2 must not use `--resume` — use `--sam3_path` instead.
+> Reason: `--resume` restores the Phase 1 optimizer state (which has only 1 param group), but Phase 2 has 2 param groups once the backbone is unfrozen, so loading it raises a mismatch error.
+> `--sam3_path` loads only the model weights and reinitializes the optimizer.
 
-**运行命令（4 GPU）：**
+**Run command (4 GPUs):**
 
 ```bash
 python -m torch.distributed.run --nproc_per_node=4 --master_port=29602 train_sam3.py \
@@ -132,7 +132,7 @@ python -m torch.distributed.run --nproc_per_node=4 --master_port=29602 train_sam
   --num_workers 4
 ```
 
-**实际结果（各次实验）：**
+**Actual results (across runs):**
 
 | Run | From | finetune_ratio | LR | Best val_loss | Best mask_IoU |
 |-----|------|----------------|----|--------------|--------------|
@@ -141,35 +141,35 @@ python -m torch.distributed.run --nproc_per_node=4 --master_port=29602 train_sam
 | `phase2_h200_ft2` | phase1_h200 | 0.02 | 1e-4 | 2.575 | 0.520 |
 | `phase2` | phase1_h200_lr6e4 | 0.01 | 1e-4 | 3.053 | 0.380 |
 
-> **最佳 Phase 2 checkpoint：`checkpoints/phase2_h200_ft3/best`**
+> **Best Phase 2 checkpoint: `checkpoints/phase2_h200_ft3/best`**
 
-**观察：**
-- Phase 2 从好的 Phase 1 起点出发至关重要（`phase1_h200` IoU 0.529 → `phase2_h200_ft3` IoU 0.527）
-- 从差的 Phase 1 起点出发（`phase1_h200_lr6e4` IoU 0.392 → `phase2` IoU 0.380），Phase 2 无法弥补
-- `finetune_ratio=0.05` 效果好于 `0.01` 和 `0.02`
-- Phase 2 的 IoU 比 Phase 1 更稳定（backbone 解冻后特征更强）
+**Observations:**
+- Starting Phase 2 from a good Phase 1 checkpoint matters a lot (`phase1_h200` IoU 0.529 → `phase2_h200_ft3` IoU 0.527)
+- Starting from a weak Phase 1 checkpoint (`phase1_h200_lr6e4` IoU 0.392 → `phase2` IoU 0.380), Phase 2 can't make up the gap
+- `finetune_ratio=0.05` outperforms `0.01` and `0.02`
+- Phase 2 IoU is more stable than Phase 1 (features are stronger once the backbone is unfrozen)
 
 ---
 
-## 显存注意事项
+## VRAM notes
 
-| 阶段 | GPU 数 | batch_size | backbone 梯度 | 每 GPU 显存 |
+| Phase | GPUs | batch_size | Backbone gradients | Per-GPU VRAM |
 |------|--------|-----------|--------------|------------|
 | Phase 1 | 1 | 64 | ✗ | ~40 GB |
 | Phase 2 | 4 | 4 | ✓ | ~120 GB |
 
-Phase 2 backbone 解冻后显存需求暴增。在 H200 (140 GB) 上，`batch_size=16` OOM，需降至 `batch_size=4`。
+VRAM usage jumps sharply once the Phase 2 backbone is unfrozen. On H200 (140 GB), `batch_size=16` OOMs — you need to drop to `batch_size=4`.
 
 ---
 
-## 模型选择标准
+## Model selection criteria
 
-- **Phase 1**：用 `val_loss`（mask_iou 噪声太大，容易被早期峰值锁死）
-- **Phase 2**：`val_loss` 和 `mask_iou` 均可参考，通常一致
+- **Phase 1**: use `val_loss` (mask_iou is too noisy and can get locked to an early spike)
+- **Phase 2**: both `val_loss` and `mask_iou` are usable and generally agree
 
 ---
 
-## 使用训练好的模型
+## Using a trained model
 
 ```python
 from transformers import Sam3Model, Sam3Processor
@@ -181,7 +181,7 @@ model = Sam3Model.from_pretrained(
 processor = Sam3Processor.from_pretrained("checkpoints/phase2_h200_ft3/best")
 ```
 
-在推理 pipeline 中：
+In the inference pipeline:
 
 ```python
 detector = Sam3ImageDetector(
@@ -191,15 +191,15 @@ detector = Sam3ImageDetector(
 
 ---
 
-## Loss 权重说明
+## Loss weight notes
 
 ```
-cls_loss_weight     = 1.0   # Focal loss，分类
-box_loss_weight     = 5.0   # L1 loss，bounding box 回归
-giou_loss_weight    = 2.0   # GIoU loss，box 形状
-mask_loss_weight    = 3.0   # BCE loss，mask 像素级
-dice_loss_weight    = 3.0   # Dice loss，mask 整体形状
-presence_loss_weight = 1.0  # 目标是否存在
+cls_loss_weight      = 1.0   # Focal loss, classification
+box_loss_weight      = 1.0   # L1 loss, bounding box regression
+giou_loss_weight     = 1.0   # GIoU loss, box shape
+mask_loss_weight     = 3.0   # BCE loss, per-pixel mask
+dice_loss_weight     = 3.0   # Dice loss, overall mask shape
+presence_loss_weight = 1.0   # whether the object is present
 ```
 
-Mask 相关 loss（BCE + Dice）权重设为 3.0（高于默认），强调 segmentation 质量。
+All of the above are the script's own defaults — neither run command above overrides `cls`, `box`, `giou`, or `presence`, and `mask`/`dice` are only passed explicitly for clarity. The mask-related losses (BCE + Dice) already default higher than the rest, which emphasizes segmentation quality over box/class accuracy.

@@ -7,7 +7,7 @@ Run the labeler on one GPU machine and access it from any browser on the same ne
 ## 1. Start the server
 
 ```bash
-cd /home/bill/qwen3vl2sam
+cd /path/to/sam3labeler
 python run_batch.py --labeler --port 7777
 ```
 
@@ -21,7 +21,7 @@ On the server machine:
 
 ```bash
 ip route get 1 | awk '{print $7; exit}'
-# example output: 192.168.50.173
+# example output: 192.168.1.50
 ```
 
 Or check `ip addr` / `ifconfig` and look for your LAN interface (usually `eth0` or `enp*`).
@@ -33,10 +33,10 @@ Or check `ip addr` / `ifconfig` and look for your LAN interface (usually `eth0` 
 On any machine on the same network, open a browser and go to:
 
 ```
-http://192.168.50.173:7777
+http://192.168.1.50:7777
 ```
 
-Replace `192.168.50.173` with whatever IP the step above returned.
+Replace `192.168.1.50` with whatever IP the step above returned.
 
 ---
 
@@ -53,7 +53,7 @@ sudo ufw reload
 **Check it worked:**
 ```bash
 # From another machine
-curl -s http://192.168.50.173:7777/api/datasets | head -c 100
+curl -s http://192.168.1.50:7777/api/datasets | head -c 100
 ```
 
 ---
@@ -79,11 +79,11 @@ Description=SAM3 Labeler
 After=network.target
 
 [Service]
-User=bill
-WorkingDirectory=/home/bill/qwen3vl2sam
+User=<your-username>
+WorkingDirectory=/path/to/sam3labeler
 ExecStart=/usr/bin/python3 run_batch.py --labeler --port 7777
 Restart=on-failure
-Environment=LABELER_CONFIG=/home/bill/qwen3vl2sam/config.yaml
+Environment=LABELER_CONFIG=/path/to/sam3labeler/config.yaml
 
 [Install]
 WantedBy=multi-user.target
@@ -119,11 +119,11 @@ The dataset folder (e.g. `outputs/run_20260318/`) must be accessible on the serv
 ```bash
 # Server: share the outputs folder
 sudo apt install nfs-kernel-server
-echo "/home/bill/qwen3vl2sam/outputs  192.168.50.0/24(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+echo "/path/to/sam3labeler/outputs  192.168.1.0/24(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
 sudo exportfs -ra
 
 # Client: mount it
-sudo mount 192.168.50.173:/home/bill/qwen3vl2sam/outputs /mnt/labeler_outputs
+sudo mount 192.168.1.50:/path/to/sam3labeler/outputs /mnt/labeler_outputs
 ```
 
 Then point the labeler at `/mnt/labeler_outputs` from the client — though it's simpler to just run the browser on the server machine and let everyone use the web UI.

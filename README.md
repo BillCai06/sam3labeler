@@ -37,7 +37,7 @@ Image + class list
 
 ## Requirements
 
-- Linux (tested Ubuntu 22.04)
+- Linux (tested Ubuntu 22.04) or Windows (via `setup_env.bat`, run from Anaconda Prompt)
 - NVIDIA GPU, CUDA 12.x
 - ~6 GB VRAM (SAM3 image backend)
 - conda or mamba
@@ -57,6 +57,8 @@ cd ~/qwen3vl2sam
 ```bash
 bash setup_env.sh
 ```
+
+On Windows, run `setup_env.bat` from an Anaconda Prompt instead.
 
 Creates a conda env named `qwen3vl2sam`, installs all dependencies, and installs SAM2 from Meta's GitHub. Takes 5–10 minutes on first run.
 
